@@ -1,6 +1,6 @@
 // Defines the amount of time that should elapse between each physics step.
 const TIME_STEP: f32 = 1.0 / 60.0;
-const PHYS_TIME_STEP: f32 = 1.0 / 120.0;
+const PHYS_TIME_STEP: f32 = 1.0 / 360.0;
 
 const WIDTH: f32 = 1500.0;
 const HEIGHT: f32 = 1200.0;
@@ -18,14 +18,13 @@ const TOP_WALL: f32 = HEIGHT;
 // We set the z-value of the ball to 1 so it renders on top in the case of overlapping sprites.
 const BALL_STARTING_POSITION: Vec2 = Vec2::new(LEFT_WALL + 40.0, TOP_WALL / 2.0);
 const BALL_SIZE: f32 = 6.0;
-const BALL_SPEED: f32 = 700.0;
+const BALL_SPEED: f32 = 900.0;
 const INITIAL_BALL_DIRECTION: Vec2 = Vec2::new(0.5, -0.5);
 
 const BACKGROUND_COLOR: Color = Color::from_rgb(0., 0., 0.);
 
-use std::sync::mpsc::{channel, Sender, Receiver};
-use std::sync::{Mutex, Arc};
-
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use speedy2d::color::Color;
 use speedy2d::dimen::{Vec2, Vector2};
@@ -36,12 +35,11 @@ use speedy2d::{Graphics2D, Window};
 
 const GRAVITY: Vector2<f32> = Vec2::new(0.0, 9.8);
 
-
 #[derive(Default, Clone)]
 struct ShareData {
     c_pos: Vec<Vec2>,
     c_color: Vec<f32>,
-    phys_time: f32
+    phys_time: f32,
 }
 
 struct Physics {
@@ -50,26 +48,40 @@ struct Physics {
     table: Vec<Vec<usize>>,
     others: Vec<usize>,
     currents: Vec<usize>,
-    cannon_rx: Receiver<()>
+    cannon_rx: Receiver<()>,
+}
+
+fn field(mut pos: Vec2) -> Vec2 {
+    pos *= 0.01;
+    let dx = (pos.y + pos.x).sin();
+    let dy = (pos.x - pos.y).cos();
+    Vec2::new(dx, dy) * 10.0
 }
 
 impl Physics {
-
     fn step(&mut self, dt: f32, share: &mut ShareData) {
         self.phys_time = std::time::Instant::now();
-        self.euler(dt, &mut share.c_pos);
+        self.euler(dt, share);
         let nb_checks = self.check_ball_collisions(&mut share.c_pos);
     }
 
-    fn euler(&mut self, dt: f32, c_pos: &mut Vec<Vec2>) {
-        for (c_pos, c_opos) in c_pos.iter_mut().zip(&mut self.c_opos) {
+    fn euler(&mut self, dt: f32, share: &mut ShareData) {
+        for ((c_pos, c_opos), c_color) in share
+            .c_pos
+            .iter_mut()
+            .zip(&mut self.c_opos)
+            .zip(share.c_color.iter_mut())
+        {
             let oldnpos = *c_pos;
-            *c_pos = *c_pos * 2.0 - *c_opos + GRAVITY * dt;
+            let velocity = (*c_pos - *c_opos) * 20.;
+            *c_color = (velocity.magnitude() + 198.) % 360.;
+
+            *c_pos = *c_pos * 2.0 - *c_opos + (field(*c_pos) + GRAVITY) * dt;
             *c_opos = oldnpos;
         }
     }
 
-    fn check_ball_collisions(&mut self, c_pos: &mut Vec<Vec2>) -> i32 {
+    fn check_ball_collisions(&mut self, c_pos: &mut [Vec2]) -> i32 {
         let mut nb = 0;
 
         for _ in 0..6 {
@@ -137,14 +149,12 @@ impl Physics {
             }
 
             self.check_wall_collisions(c_pos);
-
         }
 
         nb
     }
 
-    fn check_wall_collisions(&mut self, c_pos: &mut Vec<Vec2>) {
-
+    fn check_wall_collisions(&mut self, c_pos: &mut [Vec2]) {
         for x in 0..(X_LEN) as usize {
             for &i in self.table[0 * X_LEN as usize + x].iter() {
                 do_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
@@ -152,7 +162,7 @@ impl Physics {
         }
 
         for x in 0..(X_LEN) as usize {
-            for &i in self.table[((Y_LEN-1.0) * X_LEN) as usize + x].iter() {
+            for &i in self.table[((Y_LEN - 1.0) * X_LEN) as usize + x].iter() {
                 do_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
             }
         }
@@ -164,33 +174,35 @@ impl Physics {
         }
 
         for y in 0..(Y_LEN) as usize {
-            for &i in self.table[y * X_LEN as usize + (X_LEN-1.0) as usize].iter() {
+            for &i in self.table[y * X_LEN as usize + (X_LEN - 1.0) as usize].iter() {
                 do_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
             }
         }
-
     }
 
-    
-    fn do_cannon(&mut self, dt: f32, share: &mut ShareData){
+    fn do_cannon(&mut self, dt: f32, share: &mut ShareData) {
         let c_pos = &mut share.c_pos;
         let c_color = &mut share.c_color;
-        let h = *c_color.last().unwrap_or(&0.);
-        let hsl = ((h + 0.1) % 360., 0.75, 0.5);
         for k in 0..10 {
-            self.cannon(-k as f32 * (BALL_SIZE + 5.0), hsl, dt + (k as f32 * 0.0001), c_pos, c_color);
+            self.cannon(-k as f32 * (2.0 * BALL_SIZE), 0., dt, c_pos, c_color);
         }
     }
 
-
-    fn cannon(&mut self, shift: f32, color: (f32, f32, f32), dt: f32, c_pos: &mut Vec<Vec2>, c_color: &mut Vec<f32>) {
+    fn cannon(
+        &mut self,
+        shift: f32,
+        color: f32,
+        dt: f32,
+        c_pos: &mut Vec<Vec2>,
+        c_color: &mut Vec<f32>,
+    ) {
         let ball_pos = BALL_STARTING_POSITION + Vec2::new(0.0, shift);
         let speed = INITIAL_BALL_DIRECTION.normalize().unwrap() * BALL_SPEED * dt;
         let ball_opos = ball_pos - speed;
 
         c_pos.push(ball_pos);
         self.c_opos.push(ball_opos);
-        c_color.push(color.0);
+        c_color.push(color);
     }
 }
 
@@ -205,15 +217,14 @@ fn main() {
 
     let (cannon_tx, cannon_rx) = channel();
 
-
-    let physics_thread_handle = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut physics = Physics {
             c_opos: Vec::default(),
             phys_time: std::time::Instant::now(),
             table: vec![Vec::new(); ((X_LEN + 1.0) * (Y_LEN + 1.0)) as usize],
-            others: Vec::with_capacity(10000),
-            currents: Vec::with_capacity(10000),
-            cannon_rx
+            others: Vec::with_capacity(30000),
+            currents: Vec::with_capacity(30000),
+            cannon_rx,
         };
 
         let clock = std::time::Instant::now();
@@ -225,21 +236,20 @@ fn main() {
                 let Ok(mut share) = to_physics_thread.try_lock() else {
                     continue;
                 };
-                
+
                 physics.step(dt, &mut share);
 
                 if do_cannon {
                     physics.do_cannon(dt, &mut share);
                     do_cannon = false;
                 }
-                
+
                 share.phys_time = dt;
                 phys_frame_start = clock.elapsed().as_secs_f32();
             }
-            
-            match physics.cannon_rx.try_recv() {
-                Ok(_) => {do_cannon = true;},
-                _ => ()
+
+            if physics.cannon_rx.try_recv().is_ok() {
+                do_cannon = true;
             }
         }
     });
@@ -247,11 +257,8 @@ fn main() {
     window.run_loop(MyWindowHandler {
         font,
         share: to_draw_thread,
-        cannon_tx
+        cannon_tx,
     });
-
-
-    physics_thread_handle.join().unwrap();
 }
 
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
@@ -280,9 +287,8 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
 struct MyWindowHandler {
     font: Font,
     share: Arc<Mutex<ShareData>>,
-    cannon_tx: Sender<()>
+    cannon_tx: Sender<()>,
 }
-
 
 impl WindowHandler for MyWindowHandler {
     fn on_draw(&mut self, helper: &mut WindowHelper, graphics: &mut Graphics2D) {
@@ -294,15 +300,15 @@ impl WindowHandler for MyWindowHandler {
         graphics.clear_screen(BACKGROUND_COLOR);
         for (pos, h) in share_data.c_pos.iter().zip(&share_data.c_color) {
             let (r, g, b) = hsl_to_rgb(*h, 0.75, 0.5);
-            graphics.draw_circle(pos, BALL_SIZE, Color::WHITE);
-            graphics.draw_circle(pos, BALL_SIZE - 1.0, Color::from_rgb(r, g, b));
+            graphics.draw_circle(pos, BALL_SIZE + 4.0, Color::from_rgb(r, g, b));
+            graphics.draw_circle(pos, BALL_SIZE, Color::from_rgb(r, g, b));
         }
 
         let text = self.font.layout_text(
             &format!(
                 "phy step: {:.3} ms\nnb obj: {}",
                 // "total: {:.3} ms\nball: {:.3} ms\ncollision: {}\nnb obj: {}",
-                share_data.phys_time*1000.0,
+                share_data.phys_time * 1000.0,
                 share_data.c_pos.len()
             ),
             28.0,
@@ -359,7 +365,6 @@ fn wall_collides(pos_a: Vec2, scale_a: f32) -> (Option<Collision>, Option<Collis
     (hor, vert)
 }
 
-
 fn do_wall_collision(c_pos: &mut Vec2, c_opos: &mut Vec2) {
     let (hor, ver) = wall_collides(*c_pos, BALL_SIZE);
 
@@ -389,5 +394,4 @@ fn do_wall_collision(c_pos: &mut Vec2, c_opos: &mut Vec2) {
         }
         _ => {}
     }
-
 }
