@@ -6,14 +6,11 @@ const GRID_SIZE: f32 = 10.0;
 const X_LEN: f32 = WIDTH / GRID_SIZE;
 const Y_LEN: f32 = HEIGHT / GRID_SIZE;
 
-// x coordinates
 const LEFT_WALL: f32 = 0.;
 const RIGHT_WALL: f32 = WIDTH;
-// y coordinates
 const BOTTOM_WALL: f32 = 0.;
 const TOP_WALL: f32 = HEIGHT;
 
-// We set the z-value of the ball to 1 so it renders on top in the case of overlapping sprites.
 const BALL_SIZE: f32 = 4.0;
 const INITIAL_BALL_SPEED: f32 = 5.0;
 
