@@ -8,4 +8,3 @@ edition = "2021"
 [dependencies]
 ggez = "0.9.0"
 rand = "0.8.5"
-speedy2d = "1.11.0"

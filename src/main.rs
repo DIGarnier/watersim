@@ -17,22 +17,22 @@ const TOP_WALL: f32 = HEIGHT;
 
 // We set the z-value of the ball to 1 so it renders on top in the case of overlapping sprites.
 const BALL_STARTING_POSITION: Vec2 = Vec2::new(LEFT_WALL + 40.0, TOP_WALL / 2.0);
-const BALL_SIZE: f32 = 6.0;
-const BALL_SPEED: f32 = 300.0;
+const BALL_SIZE: f32 = 4.0;
+const INITIAL_BALL_SPEED: f32 = 5.0;
 const INITIAL_BALL_DIRECTION: Vec2 = Vec2::new(0.5, -0.5);
 
 const BACKGROUND_COLOR: Color = Color::new(0., 0., 0., 0.0);
 
 use std::path;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 
 use ggez::conf::{WindowMode, WindowSetup};
+use ggez::event::MouseButton;
 use ggez::glam::Vec2;
-use ggez::graphics::{Color, DrawMode, DrawParam, InstanceArray, Mesh, Text, Rect, Image};
-use ggez::input::keyboard::{KeyCode, KeyInput};
-use ggez::winit::window::Window;
-use ggez::{event, graphics, timer, Context, ContextBuilder, GameResult};
+use ggez::graphics::{Color, DrawMode, DrawParam, Image, InstanceArray, Mesh, Text};
+
+use ggez::{event, graphics, Context, ContextBuilder, GameResult};
 
 const GRAVITY: Vec2 = Vec2::new(0.0, 9.8);
 
@@ -49,7 +49,7 @@ struct Physics {
     table: Vec<Vec<usize>>,
     others: Vec<usize>,
     currents: Vec<usize>,
-    cannon_rx: Receiver<()>,
+    cannon_rx: Receiver<(Vec2, Vec2)>,
 }
 
 fn field(mut pos: Vec2) -> Vec2 {
@@ -63,7 +63,7 @@ impl Physics {
     fn step(&mut self, dt: f32, share: &mut ShareData) {
         self.phys_time = std::time::Instant::now();
         self.euler(dt, share);
-        let nb_checks = self.check_ball_collisions(&mut share.c_pos);
+        let _nb_checks = self.check_ball_collisions(&mut share.c_pos);
     }
 
     fn euler(&mut self, dt: f32, share: &mut ShareData) {
@@ -171,7 +171,7 @@ impl Physics {
         }
 
         for y in 0..(Y_LEN) as usize {
-            for &i in self.table[y * X_LEN as usize + 0].iter() {
+            for &i in self.table[y * X_LEN as usize].iter() {
                 do_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
             }
         }
@@ -183,11 +183,19 @@ impl Physics {
         }
     }
 
-    fn do_cannon(&mut self, dt: f32, share: &mut ShareData) {
+    fn do_cannon(&mut self, dt: f32, share: &mut ShareData, start: Vec2, cannon: Vec2) {
         let c_pos = &mut share.c_pos;
         let c_color = &mut share.c_color;
-        for k in 0..10 {
-            self.cannon(-k as f32 * (2.0 * BALL_SIZE), 0., dt, c_pos, c_color);
+        for k in 0..5 {
+            self.cannon(
+                -k as f32 * (2.2 * BALL_SIZE),
+                0.,
+                dt,
+                c_pos,
+                c_color,
+                start,
+                cannon,
+            );
         }
     }
 
@@ -198,9 +206,11 @@ impl Physics {
         dt: f32,
         c_pos: &mut Vec<Vec2>,
         c_color: &mut Vec<f32>,
+        start: Vec2,
+        cannon: Vec2,
     ) {
-        let ball_pos = BALL_STARTING_POSITION + Vec2::new(0.0, shift);
-        let speed = INITIAL_BALL_DIRECTION.normalize() * BALL_SPEED * dt;
+        let ball_pos = start + cannon.perp().normalize() * shift;
+        let speed = cannon * INITIAL_BALL_SPEED * dt;
         let ball_opos = ball_pos - speed;
 
         c_pos.push(ball_pos);
@@ -239,9 +249,9 @@ fn main() -> GameResult {
 
         let clock = std::time::Instant::now();
         let mut phys_frame_start = clock.elapsed().as_secs_f32();
-        let mut do_cannon = false;
         loop {
             let dt = clock.elapsed().as_secs_f32() - phys_frame_start;
+            
             if dt >= PHYS_TIME_STEP {
                 let Ok(mut share) = to_physics_thread.lock() else {
                     continue;
@@ -249,18 +259,14 @@ fn main() -> GameResult {
 
                 physics.step(dt, &mut share);
 
-                if do_cannon {
-                    physics.do_cannon(dt, &mut share);
-                    do_cannon = false;
+                if let Ok((start, cannon)) = physics.cannon_rx.try_recv() {
+                    physics.do_cannon(dt, &mut share, start, cannon);
                 }
 
                 share.phys_time = dt;
                 phys_frame_start = clock.elapsed().as_secs_f32();
             }
 
-            if physics.cannon_rx.try_recv().is_ok() {
-                do_cannon = true;
-            }
         }
     });
 
@@ -294,18 +300,20 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
 struct MainState {
     share: Arc<Mutex<ShareData>>,
     shader: graphics::Shader,
-    cannon_tx: Sender<()>,
+    cannon_tx: Sender<(Vec2, Vec2)>,
     circles: InstanceArray,
     circle: Mesh,
     nb_obj: usize,
-    image: Image
+    image: Image,
+    mouse_start_pos: Option<Vec2>,
+    cannon: Option<Vec2>,
 }
 
 impl MainState {
     fn new(
         ctx: &mut Context,
         share: Arc<Mutex<ShareData>>,
-        cannon_tx: Sender<()>,
+        cannon_tx: Sender<(Vec2, Vec2)>,
     ) -> GameResult<MainState> {
         let shader = graphics::ShaderBuilder::new()
             .fragment_path("/blur.wgsl")
@@ -329,7 +337,15 @@ impl MainState {
             circles,
             circle,
             nb_obj: 0,
-            image: Image::new_canvas_image(ctx, ctx.gfx.surface_format(), WIDTH as _, HEIGHT as _, 1)
+            image: Image::new_canvas_image(
+                ctx,
+                ctx.gfx.surface_format(),
+                WIDTH as _,
+                HEIGHT as _,
+                1,
+            ),
+            mouse_start_pos: None,
+            cannon: None,
         })
     }
 }
@@ -357,9 +373,53 @@ impl event::EventHandler<ggez::GameError> for MainState {
 
             self.nb_obj = share_data.c_pos.len();
 
-            if ctx.keyboard.is_key_pressed(KeyCode::C) {
-                self.cannon_tx.send(()).unwrap();
+            match (self.mouse_start_pos, self.cannon) {
+                (Some(start), Some(cannon)) => self.cannon_tx.send((start, cannon)).unwrap(),
+                _ => {}
             }
+        }
+
+        Ok(())
+    }
+
+    fn mouse_button_down_event(
+        &mut self,
+        _ctx: &mut Context,
+        button: MouseButton,
+        x: f32,
+        y: f32,
+    ) -> GameResult {
+        if MouseButton::Left == button {
+            self.mouse_start_pos = Some((x, y).into());
+        }
+
+        Ok(())
+    }
+
+    fn mouse_button_up_event(
+        &mut self,
+        _ctx: &mut Context,
+        button: MouseButton,
+        _x: f32,
+        _y: f32,
+    ) -> GameResult {
+        if MouseButton::Left == button {
+            self.mouse_start_pos = None;
+            self.cannon = None;
+        }
+        Ok(())
+    }
+
+    fn mouse_motion_event(
+        &mut self,
+        _ctx: &mut Context,
+        x: f32,
+        y: f32,
+        _dx: f32,
+        _dy: f32,
+    ) -> GameResult {
+        if let Some(start) = self.mouse_start_pos {
+            self.cannon = Some(Vec2::new(x, y) - start);
         }
 
         Ok(())
@@ -370,8 +430,7 @@ impl event::EventHandler<ggez::GameError> for MainState {
         canvas.draw_instanced_mesh(self.circle.clone(), &self.circles, DrawParam::default());
         canvas.finish(ctx)?;
 
-        
-        let mut canvas = graphics::Canvas::from_frame(ctx,  BACKGROUND_COLOR);
+        let mut canvas = graphics::Canvas::from_frame(ctx, BACKGROUND_COLOR);
 
         canvas.set_shader(&self.shader);
         canvas.draw(&self.image, DrawParam::default());
