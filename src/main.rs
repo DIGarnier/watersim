@@ -12,7 +12,7 @@ const BOTTOM_WALL: f32 = 0.;
 const TOP_WALL: f32 = HEIGHT;
 
 const BALL_SIZE: f32 = 4.0;
-const INITIAL_BALL_SPEED: f32 = 5.0;
+const INITIAL_BALL_SPEED_MODIFIER: f32 = 5.0;
 
 const BACKGROUND_COLOR: Color = Color::new(0., 0., 0., 0.0);
 
@@ -55,11 +55,11 @@ fn field(mut pos: Vec2) -> Vec2 {
 impl Physics {
     fn step(&mut self, dt: f32, share: &mut ShareData) {
         self.phys_time = std::time::Instant::now();
-        self.euler(dt, share);
+        self.integrate(dt, share);
         let _nb_checks = self.check_ball_collisions(&mut share.c_pos);
     }
 
-    fn euler(&mut self, dt: f32, share: &mut ShareData) {
+    fn integrate(&mut self, dt: f32, share: &mut ShareData) {
         for ((c_pos, c_opos), c_color) in share
             .c_pos
             .iter_mut()
@@ -153,25 +153,25 @@ impl Physics {
     fn check_wall_collisions(&mut self, c_pos: &mut [Vec2]) {
         for x in 0..(X_LEN) as usize {
             for &i in self.table[0 * X_LEN as usize + x].iter() {
-                do_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
+                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
             }
         }
 
         for x in 0..(X_LEN) as usize {
             for &i in self.table[((Y_LEN - 1.0) * X_LEN) as usize + x].iter() {
-                do_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
+                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
             }
         }
 
         for y in 0..(Y_LEN) as usize {
             for &i in self.table[y * X_LEN as usize].iter() {
-                do_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
+                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
             }
         }
 
         for y in 0..(Y_LEN) as usize {
             for &i in self.table[y * X_LEN as usize + (X_LEN - 1.0) as usize].iter() {
-                do_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
+                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
             }
         }
     }
@@ -203,7 +203,7 @@ impl Physics {
         cannon: Vec2,
     ) {
         let ball_pos = start + cannon.perp().normalize() * shift;
-        let speed = cannon * INITIAL_BALL_SPEED * dt;
+        let speed = cannon * INITIAL_BALL_SPEED_MODIFIER * dt;
         let ball_opos = ball_pos - speed;
 
         c_pos.push(ball_pos);
@@ -226,10 +226,9 @@ fn main() -> GameResult {
     let share_data = Arc::default();
 
     let to_physics_thread: Arc<Mutex<ShareData>> = Arc::clone(&share_data);
-    let to_draw_thread = Arc::clone(&share_data);
-
+    
     let (cannon_tx, cannon_rx) = channel();
-
+    
     std::thread::spawn(move || {
         let mut physics = Physics {
             c_opos: Vec::default(),
@@ -249,46 +248,26 @@ fn main() -> GameResult {
                 let Ok(mut share) = to_physics_thread.lock() else {
                     continue;
                 };
-
+                
                 physics.step(dt, &mut share);
-
+                
                 if let Ok((start, cannon)) = physics.cannon_rx.try_recv() {
                     physics.do_cannon(dt, &mut share, start, cannon);
                 }
-
+                
                 share.phys_time = dt;
                 phys_frame_start = clock.elapsed().as_secs_f32();
             }
-
+            
         }
     });
-
+    
+    let to_draw_thread = Arc::clone(&share_data);
     let state = MainState::new(&mut ctx, to_draw_thread, cannon_tx)?;
     event::run(ctx, events_loop, state)
 }
 
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-    let m = l - c / 2.0;
 
-    let (r, g, b) = match h {
-        h if h < 0.0 => (0.0, 0.0, 0.0),
-        h if h < 60.0 => (c, x, 0.0),
-        h if h < 120.0 => (x, c, 0.0),
-        h if h < 180.0 => (0.0, c, x),
-        h if h < 240.0 => (0.0, x, c),
-        h if h < 300.0 => (x, 0.0, c),
-        h if h < 360.0 => (c, 0.0, x),
-        _ => (0.0, 0.0, 0.0),
-    };
-
-    let r = ((r + m) * 255.0).round();
-    let b = ((b + m) * 255.0).round();
-    let g = ((g + m) * 255.0).round();
-
-    (r / 255.0, g / 255.0, b / 255.0)
-}
 
 struct MainState {
     share: Arc<Mutex<ShareData>>,
@@ -424,7 +403,6 @@ impl event::EventHandler<ggez::GameError> for MainState {
         canvas.finish(ctx)?;
 
         let mut canvas = graphics::Canvas::from_frame(ctx, BACKGROUND_COLOR);
-
         canvas.set_shader(&self.shader);
         canvas.draw(&self.image, DrawParam::default());
         canvas.set_default_shader();
@@ -455,7 +433,7 @@ enum Collision {
     Right,
 }
 
-fn wall_collides(pos_a: Vec2, scale_a: f32) -> (Option<Collision>, Option<Collision>) {
+fn collides_wall(pos_a: Vec2, scale_a: f32) -> (Option<Collision>, Option<Collision>) {
     let mut vert = None;
     if pos_a.y - scale_a <= BOTTOM_WALL {
         vert = Some(Collision::Bottom);
@@ -473,8 +451,8 @@ fn wall_collides(pos_a: Vec2, scale_a: f32) -> (Option<Collision>, Option<Collis
     (hor, vert)
 }
 
-fn do_wall_collision(c_pos: &mut Vec2, c_opos: &mut Vec2) {
-    let (hor, ver) = wall_collides(*c_pos, BALL_SIZE);
+fn resolve_wall_collision(c_pos: &mut Vec2, c_opos: &mut Vec2) {
+    let (hor, ver) = collides_wall(*c_pos, BALL_SIZE);
 
     let curr_vel = (*c_pos - *c_opos) * 0.4;
     use Collision::*;
@@ -502,4 +480,27 @@ fn do_wall_collision(c_pos: &mut Vec2, c_opos: &mut Vec2) {
         }
         _ => {}
     }
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    
+    let (r, g, b) = match h {
+        h if h < 0.0 => (0.0, 0.0, 0.0),
+        h if h < 60.0 => (c, x, 0.0),
+        h if h < 120.0 => (x, c, 0.0),
+        h if h < 180.0 => (0.0, c, x),
+        h if h < 240.0 => (0.0, x, c),
+        h if h < 300.0 => (x, 0.0, c),
+        h if h < 360.0 => (c, 0.0, x),
+        _ => (0.0, 0.0, 0.0),
+    };
+
+    let r = ((r + m) * 255.0).round();
+    let b = ((b + m) * 255.0).round();
+    let g = ((g + m) * 255.0).round();
+
+    (r / 255.0, g / 255.0, b / 255.0)
 }
