@@ -1,6 +1,6 @@
 // Defines the amount of time that should elapse between each physics step.
 const TIME_STEP: f32 = 1.0 / 60.0;
-const PHYS_TIME_STEP: f32 = 1.0 / 360.0;
+const PHYS_TIME_STEP: f32 = 1.0 / 240.0;
 
 const WIDTH: f32 = 1500.0;
 const HEIGHT: f32 = 1200.0;
@@ -18,22 +18,23 @@ const TOP_WALL: f32 = HEIGHT;
 // We set the z-value of the ball to 1 so it renders on top in the case of overlapping sprites.
 const BALL_STARTING_POSITION: Vec2 = Vec2::new(LEFT_WALL + 40.0, TOP_WALL / 2.0);
 const BALL_SIZE: f32 = 6.0;
-const BALL_SPEED: f32 = 900.0;
+const BALL_SPEED: f32 = 300.0;
 const INITIAL_BALL_DIRECTION: Vec2 = Vec2::new(0.5, -0.5);
 
-const BACKGROUND_COLOR: Color = Color::from_rgb(0., 0., 0.);
+const BACKGROUND_COLOR: Color = Color::new(0., 0., 0., 0.0);
 
+use std::path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use speedy2d::color::Color;
-use speedy2d::dimen::{Vec2, Vector2};
-use speedy2d::font::{Font, TextLayout, TextOptions};
-use speedy2d::shape::Rect;
-use speedy2d::window::{KeyScancode, VirtualKeyCode, WindowHandler, WindowHelper};
-use speedy2d::{Graphics2D, Window};
+use ggez::conf::{WindowMode, WindowSetup};
+use ggez::glam::Vec2;
+use ggez::graphics::{Color, DrawMode, DrawParam, InstanceArray, Mesh, Text, Rect, Image};
+use ggez::input::keyboard::{KeyCode, KeyInput};
+use ggez::winit::window::Window;
+use ggez::{event, graphics, timer, Context, ContextBuilder, GameResult};
 
-const GRAVITY: Vector2<f32> = Vec2::new(0.0, 9.8);
+const GRAVITY: Vec2 = Vec2::new(0.0, 9.8);
 
 #[derive(Default, Clone)]
 struct ShareData {
@@ -74,7 +75,7 @@ impl Physics {
         {
             let oldnpos = *c_pos;
             let velocity = (*c_pos - *c_opos) * 20.;
-            *c_color = (velocity.magnitude() + 198.) % 360.;
+            *c_color = (velocity.length() + 198.) % 360.;
 
             *c_pos = *c_pos * 2.0 - *c_opos + (field(*c_pos) + GRAVITY) * dt;
             *c_opos = oldnpos;
@@ -84,7 +85,7 @@ impl Physics {
     fn check_ball_collisions(&mut self, c_pos: &mut [Vec2]) -> i32 {
         let mut nb = 0;
 
-        for _ in 0..6 {
+        for _ in 0..8 {
             for i in 0..(X_LEN * Y_LEN) as usize {
                 self.table[i].clear();
             }
@@ -119,9 +120,10 @@ impl Physics {
 
                             if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
                                 let mut col_axis = pos_a - pos_b;
-                                let mvt = 0.75 * (col_axis.magnitude() - (BALL_SIZE + BALL_SIZE));
-                                col_axis =
-                                    col_axis.normalize().unwrap_or_else(|| Vec2::new(0., 0.));
+                                let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
+                                col_axis = col_axis
+                                    .try_normalize()
+                                    .unwrap_or_else(|| Vec2::new(0., 0.));
                                 c_pos[self.currents[i]] -= col_axis * mvt / 2.0;
                                 c_pos[self.currents[j]] += col_axis * mvt / 2.0;
                             }
@@ -136,9 +138,10 @@ impl Physics {
 
                             if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
                                 let mut col_axis = pos_a - pos_b;
-                                let mvt = 0.75 * (col_axis.magnitude() - (BALL_SIZE + BALL_SIZE));
-                                col_axis =
-                                    col_axis.normalize().unwrap_or_else(|| Vec2::new(0., 0.));
+                                let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
+                                col_axis = col_axis
+                                    .try_normalize()
+                                    .unwrap_or_else(|| Vec2::new(0., 0.));
                                 c_pos[self.currents[i]] -= col_axis * mvt / 2.0;
                                 c_pos[self.others[j]] += col_axis * mvt / 2.0;
                             }
@@ -197,7 +200,7 @@ impl Physics {
         c_color: &mut Vec<f32>,
     ) {
         let ball_pos = BALL_STARTING_POSITION + Vec2::new(0.0, shift);
-        let speed = INITIAL_BALL_DIRECTION.normalize().unwrap() * BALL_SPEED * dt;
+        let speed = INITIAL_BALL_DIRECTION.normalize() * BALL_SPEED * dt;
         let ball_opos = ball_pos - speed;
 
         c_pos.push(ball_pos);
@@ -206,9 +209,16 @@ impl Physics {
     }
 }
 
-fn main() {
-    let font = Font::new(include_bytes!("C:\\WINDOWS\\FONTS\\ARIAL.TTF")).unwrap();
-    let window = Window::new_centered("Title", (WIDTH as u32, HEIGHT as u32)).unwrap();
+fn main() -> GameResult {
+    let (mut ctx, events_loop) = ContextBuilder::new("ballz", "ggez")
+        .window_setup(
+            WindowSetup::default()
+                .title("Cached text example!")
+                .vsync(false),
+        )
+        .window_mode(WindowMode::default().dimensions(WIDTH, HEIGHT))
+        .add_resource_path(path::PathBuf::from("./resources"))
+        .build()?;
 
     let share_data = Arc::default();
 
@@ -233,7 +243,7 @@ fn main() {
         loop {
             let dt = clock.elapsed().as_secs_f32() - phys_frame_start;
             if dt >= PHYS_TIME_STEP {
-                let Ok(mut share) = to_physics_thread.try_lock() else {
+                let Ok(mut share) = to_physics_thread.lock() else {
                     continue;
                 };
 
@@ -254,11 +264,8 @@ fn main() {
         }
     });
 
-    window.run_loop(MyWindowHandler {
-        font,
-        share: to_draw_thread,
-        cannon_tx,
-    });
+    let state = MainState::new(&mut ctx, to_draw_thread, cannon_tx)?;
+    event::run(ctx, events_loop, state)
 }
 
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
@@ -284,60 +291,109 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     (r / 255.0, g / 255.0, b / 255.0)
 }
 
-struct MyWindowHandler {
-    font: Font,
+struct MainState {
     share: Arc<Mutex<ShareData>>,
+    shader: graphics::Shader,
     cannon_tx: Sender<()>,
+    circles: InstanceArray,
+    circle: Mesh,
+    nb_obj: usize,
+    image: Image
 }
 
-impl WindowHandler for MyWindowHandler {
-    fn on_draw(&mut self, helper: &mut WindowHelper, graphics: &mut Graphics2D) {
-        let Ok(share_data) = self.share.lock() else {
-            helper.request_redraw();
-            return;
-        };
+impl MainState {
+    fn new(
+        ctx: &mut Context,
+        share: Arc<Mutex<ShareData>>,
+        cannon_tx: Sender<()>,
+    ) -> GameResult<MainState> {
+        let shader = graphics::ShaderBuilder::new()
+            .fragment_path("/blur.wgsl")
+            .build(&ctx.gfx)?;
 
-        graphics.clear_screen(BACKGROUND_COLOR);
-        for (pos, h) in share_data.c_pos.iter().zip(&share_data.c_color) {
-            let (r, g, b) = hsl_to_rgb(*h, 0.75, 0.5);
-            graphics.draw_circle(pos, BALL_SIZE + 4.0, Color::from_rgb(r, g, b));
-            graphics.draw_circle(pos, BALL_SIZE, Color::from_rgb(r, g, b));
-        }
+        let circle = graphics::Mesh::new_circle(
+            ctx,
+            DrawMode::fill(),
+            Vec2::default(),
+            BALL_SIZE + 4.0,
+            0.0001,
+            Color::WHITE,
+        )?;
 
-        let text = self.font.layout_text(
-            &format!(
-                "phy step: {:.3} ms\nnb obj: {}",
-                // "total: {:.3} ms\nball: {:.3} ms\ncollision: {}\nnb obj: {}",
-                share_data.phys_time * 1000.0,
-                share_data.c_pos.len()
-            ),
-            28.0,
-            TextOptions::new(),
-        );
-        let position = Vec2::new(10.0, 10.0);
-        let crop_window = Rect::from_tuples((0.0, 0.0), (400.0, 400.0));
-        graphics.draw_text_cropped(position, crop_window, Color::BLUE, &text);
-        helper.request_redraw();
+        let circles = InstanceArray::new(ctx, None);
+
+        Ok(MainState {
+            share,
+            shader,
+            cannon_tx,
+            circles,
+            circle,
+            nb_obj: 0,
+            image: Image::new_canvas_image(ctx, ctx.gfx.surface_format(), WIDTH as _, HEIGHT as _, 1)
+        })
     }
+}
 
-    fn on_key_down(
-        &mut self,
-        _helper: &mut WindowHelper,
-        virtual_key_code: Option<VirtualKeyCode>,
-        _scancode: KeyScancode,
-    ) {
-        match virtual_key_code {
-            Some(VirtualKeyCode::C) => {
+impl event::EventHandler<ggez::GameError> for MainState {
+    fn update(&mut self, ctx: &mut Context) -> GameResult {
+        while ctx.time.check_update_time(60) {
+            let Ok(share_data) = self.share.lock() else {
+                return Ok(());
+            };
+
+            if share_data.c_pos.len() == self.nb_obj {
+                for ((i, pos), h) in share_data.c_pos.iter().enumerate().zip(&share_data.c_color) {
+                    let a = hsl_to_rgb(*h, 0.75, 0.5);
+                    self.circles
+                        .update(i as _, DrawParam::new().dest(*pos).color(a));
+                }
+            } else {
+                self.circles.clear();
+                for (pos, h) in share_data.c_pos.iter().zip(&share_data.c_color) {
+                    let a = hsl_to_rgb(*h, 0.75, 0.5);
+                    self.circles.push(DrawParam::new().dest(*pos).color(a));
+                }
+            }
+
+            self.nb_obj = share_data.c_pos.len();
+
+            if ctx.keyboard.is_key_pressed(KeyCode::C) {
                 self.cannon_tx.send(()).unwrap();
             }
-            _ => {}
         }
+
+        Ok(())
+    }
+
+    fn draw(&mut self, ctx: &mut Context) -> GameResult {
+        let mut canvas = graphics::Canvas::from_image(ctx, self.image.clone(), BACKGROUND_COLOR);
+        canvas.draw_instanced_mesh(self.circle.clone(), &self.circles, DrawParam::default());
+        canvas.finish(ctx)?;
+
+        
+        let mut canvas = graphics::Canvas::from_frame(ctx,  BACKGROUND_COLOR);
+
+        canvas.set_shader(&self.shader);
+        canvas.draw(&self.image, DrawParam::default());
+        canvas.set_default_shader();
+
+        let fps = ctx.time.fps();
+        let nb_obj = self.nb_obj;
+        let fps_display = Text::new(format!("FPS: {fps}\nnb obj: {nb_obj}"));
+
+        canvas.draw(
+            &fps_display,
+            graphics::DrawParam::from(Vec2::new(10.0, 10.0)).color(Color::WHITE),
+        );
+
+        canvas.finish(ctx)?;
+        Ok(())
     }
 }
 
 #[inline(always)]
 fn ball_collides(pos_a: Vec2, scale_a: f32, pos_b: Vec2, scale_b: f32) -> bool {
-    (pos_a - pos_b).magnitude_squared() < ((scale_a + scale_b) * (scale_a + scale_b))
+    (pos_a - pos_b).length_squared() < ((scale_a + scale_b) * (scale_a + scale_b))
 }
 
 enum Collision {
