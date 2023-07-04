@@ -1,6 +1,4 @@
-// Defines the amount of time that should elapse between each physics step.
-const TIME_STEP: f32 = 1.0 / 60.0;
-const PHYS_TIME_STEP: f32 = 1.0 / 240.0;
+const PHYS_TIME_STEP: f32 = 1.0 / 480.0;
 
 const WIDTH: f32 = 1500.0;
 const HEIGHT: f32 = 1200.0;
@@ -16,15 +14,13 @@ const BOTTOM_WALL: f32 = 0.;
 const TOP_WALL: f32 = HEIGHT;
 
 // We set the z-value of the ball to 1 so it renders on top in the case of overlapping sprites.
-const BALL_STARTING_POSITION: Vec2 = Vec2::new(LEFT_WALL + 40.0, TOP_WALL / 2.0);
 const BALL_SIZE: f32 = 4.0;
 const INITIAL_BALL_SPEED: f32 = 5.0;
-const INITIAL_BALL_DIRECTION: Vec2 = Vec2::new(0.5, -0.5);
 
 const BACKGROUND_COLOR: Color = Color::new(0., 0., 0., 0.0);
 
 use std::path;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use ggez::conf::{WindowMode, WindowSetup};
@@ -56,7 +52,7 @@ fn field(mut pos: Vec2) -> Vec2 {
     pos *= 0.01;
     let dx = (pos.y + pos.x).sin();
     let dy = (pos.x - pos.y).cos();
-    Vec2::new(dx, dy) * 10.0
+    Vec2::new(dx, dy) * 0.0
 }
 
 impl Physics {
@@ -186,7 +182,7 @@ impl Physics {
     fn do_cannon(&mut self, dt: f32, share: &mut ShareData, start: Vec2, cannon: Vec2) {
         let c_pos = &mut share.c_pos;
         let c_color = &mut share.c_color;
-        for k in 0..5 {
+        for k in 0..20 {
             self.cannon(
                 -k as f32 * (2.2 * BALL_SIZE),
                 0.,
