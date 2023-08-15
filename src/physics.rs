@@ -27,8 +27,8 @@ pub struct ShareData {
 
 fn arbitrary_vector_field(mut pos: Vec2) -> Vec2 {
     pos *= 0.01;
-    let dx = (pos.x).sin();
-    let dy = (pos.y).cos() * 10.0;
+    let dx = pos.x.sin();
+    let dy = pos.y.cos() * 10.0;
     Vec2::new(dx, dy).perp() * 0.0
 }
 
@@ -37,7 +37,6 @@ pub struct Physics {
     c_force: Vec<Vec2>,
     table: Vec<Vec<usize>>,
     others: Vec<usize>,
-    currents: Vec<usize>,
     pub rx: Receiver<EventToPthread>,
     pub scale: f32,
 }
@@ -48,7 +47,6 @@ impl Physics {
         c_force: Vec<Vec2>,
         table: Vec<Vec<usize>>,
         others: Vec<usize>,
-        currents: Vec<usize>,
         rx: Receiver<EventToPthread>,
         scale: f32,
     ) -> Self {
@@ -57,7 +55,6 @@ impl Physics {
             c_force,
             table,
             others,
-            currents,
             rx,
             scale,
         }
@@ -100,10 +97,8 @@ impl Physics {
 
             for y in 0..(Y_LEN) as usize {
                 for x in 0..(X_LEN) as usize {
-                    self.currents.clear();
                     self.others.clear();
-
-                    self.currents.extend(&self.table[y * X_LEN as usize + x]);
+                    let currents = &self.table[y * X_LEN as usize + x];
                     for dy in [-1, 0, 1] {
                         for dx in [-1, 0, 1] {
                             if dx == 0 && dy == 0 {
@@ -115,29 +110,27 @@ impl Physics {
                         }
                     }
 
-                    for i in 0..self.currents.len() {
-                        let pos_a = c_pos[self.currents[i]];
-                        for j in i + 1..self.currents.len() {
-                            let pos_b = c_pos[self.currents[j]];
+                    for i in 0..currents.len() {
+                        let pos_a = c_pos[currents[i]];
+                        for j in i + 1..currents.len() {
+                            let pos_b = c_pos[currents[j]];
 
-                            self.c_force[self.currents[i]] += force(pos_a, pos_b, self.scale) / 8.0;
+                            self.c_force[currents[i]] += force(pos_a, pos_b, self.scale) / 8.0;
 
                             if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
-                                let mut col_axis = pos_a - pos_b
-                                    + Vec2::new(rand::random::<f32>(), rand::random::<f32>())
-                                        * 0.01;
+                                let mut col_axis = pos_a - pos_b;
                                 let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
                                 col_axis = col_axis
                                     .try_normalize()
                                     .unwrap_or_else(|| Vec2::new(0., 0.));
-                                c_pos[self.currents[i]] -= col_axis * mvt / 2.0;
-                                c_pos[self.currents[j]] += col_axis * mvt / 2.0;
+                                c_pos[currents[i]] -= col_axis * mvt / 2.0;
+                                c_pos[currents[j]] += col_axis * mvt / 2.0;
                             }
                         }
                     }
 
-                    for i in 0..self.currents.len() {
-                        let pos_a = c_pos[self.currents[i]];
+                    for i in 0..currents.len() {
+                        let pos_a = c_pos[currents[i]];
                         for j in 0..self.others.len() {
                             let pos_b = c_pos[self.others[j]];
 
@@ -145,17 +138,15 @@ impl Physics {
                                 continue;
                             }
 
-                            self.c_force[self.currents[i]] += force(pos_a, pos_b, self.scale) / 8.0;
+                            self.c_force[currents[i]] += force(pos_a, pos_b, self.scale) / 8.0;
 
                             if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
-                                let mut col_axis = pos_a - pos_b
-                                    + Vec2::new(rand::random::<f32>(), rand::random::<f32>())
-                                        * 0.01;
+                                let mut col_axis = pos_a - pos_b;
                                 let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
                                 col_axis = col_axis
                                     .try_normalize()
                                     .unwrap_or_else(|| Vec2::new(0., 0.));
-                                c_pos[self.currents[i]] -= col_axis * mvt / 2.0;
+                                c_pos[currents[i]] -= col_axis * mvt / 2.0;
                                 c_pos[self.others[j]] += col_axis * mvt / 2.0;
                             }
                         }
@@ -194,7 +185,7 @@ impl Physics {
     }
 
     pub fn do_cannon(&mut self, dt: f32, share: &mut ShareData, start: Vec2, cannon: Vec2) {
-        for k in 0..1 {
+        for k in 0..20 {
             self.cannon(-k as f32 * (2.2 * BALL_SIZE), 0., dt, share, start, cannon);
         }
     }
