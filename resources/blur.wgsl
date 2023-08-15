@@ -38,12 +38,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let size = 16.0/1200.0;
 
     var color = textureSample(t, s, in.uv);
+    // return color;
 
     for (var d:f32 = 0.0; d < tau; d = d + tau/directions) {
         for (var i:f32 = 1.0/quality; i < 1.001; i = i + 1.0/quality) {
             color = color + textureSample(t, s, in.uv + vec2<f32>(cos(d), sin(d)) * size * i);
         }
     }
-
     return color / (quality * directions + 1.0);
 }
