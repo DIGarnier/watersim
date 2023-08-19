@@ -29,7 +29,7 @@ fn arbitrary_vector_field(mut pos: Vec2) -> Vec2 {
     pos *= 0.01;
     let dx = pos.x.sin();
     let dy = pos.y.cos() * 10.0;
-    Vec2::new(dx, dy).perp() * 0.0
+    Vec2::new(dx, dy).perp() * 0.0 // dirty way of disabling it
 }
 
 pub struct Physics {
