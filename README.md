@@ -1,3 +1,3 @@
 # watersim
 
-It's just bouncy balls with a blur on.
+It's just some blurry bouncy balls.
