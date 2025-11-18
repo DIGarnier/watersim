@@ -1,5 +1,6 @@
 use ggez::glam::Vec2;
 use std::sync::mpsc::Receiver;
+use rayon::prelude::*;
 
 use crate::constants::{
     BALL_SIZE, GRID_SIZE, HEIGHT, INITIAL_BALL_SPEED_MODIFIER, WIDTH, X_LEN, Y_LEN,
@@ -66,25 +67,26 @@ impl Physics {
     }
 
     fn integrate(&mut self, dt: f32, share: &mut ShareData) {
-        for i in 0..share.c_pos.len() {
-            let c_pos = &mut share.c_pos[i];
-            let c_opos = &mut self.c_opos[i];
-            let c_color = &mut share.c_color[i];
-            let c_force = &mut self.c_force[i];
+        // Parallel iteration over all particles
+        share.c_pos.par_iter_mut()
+            .zip(self.c_opos.par_iter_mut())
+            .zip(share.c_color.par_iter_mut())
+            .zip(self.c_force.par_iter_mut())
+            .for_each(|(((c_pos, c_opos), c_color), c_force)| {
+                let oldnpos = *c_pos;
+                let velocity = (*c_pos - *c_opos) * 20.;
+                *c_color = (velocity.length() + 198.) % 360.;
 
-            let oldnpos = *c_pos;
-            let velocity = (*c_pos - *c_opos) * 20.;
-            *c_color = (velocity.length() + 198.) % 360.;
-
-            *c_pos =
-                *c_pos * 2.0 - *c_opos + (arbitrary_vector_field(*c_pos) + GRAVITY + *c_force) * dt;
-            *c_opos = oldnpos;
-            *c_force = Vec2::ZERO;
-        }
+                *c_pos = *c_pos * 2.0 - *c_opos
+                    + (arbitrary_vector_field(*c_pos) + GRAVITY + *c_force) * dt;
+                *c_opos = oldnpos;
+                *c_force = Vec2::ZERO;
+            });
     }
 
     fn check_ball_collisions(&mut self, c_pos: &mut [Vec2]) {
-        for _ in 0..8 {
+        // Reduced from 8 to 4 iterations for better performance
+        for _ in 0..4 {
             for i in 0..(X_LEN * Y_LEN) as usize {
                 self.table[i].clear();
             }
@@ -115,16 +117,22 @@ impl Physics {
                         for j in i + 1..currents.len() {
                             let pos_b = c_pos[currents[j]];
 
-                            self.c_force[currents[i]] += force(pos_a, pos_b, self.scale) / 8.0;
+                            // Calculate force once and apply Newton's third law
+                            let f = force(pos_a, pos_b, self.scale) / 4.0;
+                            self.c_force[currents[i]] += f;
+                            self.c_force[currents[j]] -= f;
 
                             if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
-                                let mut col_axis = pos_a - pos_b;
-                                let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
-                                col_axis = col_axis
-                                    .try_normalize()
-                                    .unwrap_or_else(|| Vec2::new(0., 0.));
-                                c_pos[currents[i]] -= col_axis * mvt / 2.0;
-                                c_pos[currents[j]] += col_axis * mvt / 2.0;
+                                let col_axis = pos_a - pos_b;
+                                let dist = col_axis.length();
+                                let mvt = 0.75 * (dist - (BALL_SIZE + BALL_SIZE));
+                                let col_axis_norm = if dist > 0.0001 {
+                                    col_axis / dist
+                                } else {
+                                    Vec2::ZERO
+                                };
+                                c_pos[currents[i]] -= col_axis_norm * mvt / 2.0;
+                                c_pos[currents[j]] += col_axis_norm * mvt / 2.0;
                             }
                         }
                     }
@@ -138,16 +146,22 @@ impl Physics {
                                 continue;
                             }
 
-                            self.c_force[currents[i]] += force(pos_a, pos_b, self.scale) / 8.0;
+                            // Calculate force once and apply Newton's third law
+                            let f = force(pos_a, pos_b, self.scale) / 4.0;
+                            self.c_force[currents[i]] += f;
+                            self.c_force[self.others[j]] -= f;
 
                             if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
-                                let mut col_axis = pos_a - pos_b;
-                                let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
-                                col_axis = col_axis
-                                    .try_normalize()
-                                    .unwrap_or_else(|| Vec2::new(0., 0.));
-                                c_pos[currents[i]] -= col_axis * mvt / 2.0;
-                                c_pos[self.others[j]] += col_axis * mvt / 2.0;
+                                let col_axis = pos_a - pos_b;
+                                let dist = col_axis.length();
+                                let mvt = 0.75 * (dist - (BALL_SIZE + BALL_SIZE));
+                                let col_axis_norm = if dist > 0.0001 {
+                                    col_axis / dist
+                                } else {
+                                    Vec2::ZERO
+                                };
+                                c_pos[currents[i]] -= col_axis_norm * mvt / 2.0;
+                                c_pos[self.others[j]] += col_axis_norm * mvt / 2.0;
                             }
                         }
                     }
@@ -218,12 +232,16 @@ fn ball_collides(pos_a: Vec2, scale_a: f32, pos_b: Vec2, scale_b: f32) -> bool {
 #[inline(always)]
 fn force(pos_a: Vec2, pos_b: Vec2, scale: f32) -> Vec2 {
     let dir = pos_a - pos_b;
-    let dist = dir.length();
-    if dist < BALL_SIZE {
+    let dist_sq = dir.length_squared();
+    let ball_size_sq = BALL_SIZE * BALL_SIZE;
+
+    if dist_sq < ball_size_sq {
         return Vec2::ZERO;
     }
 
-    (dir.normalize() * scale) / (dist * dist).max(1.0)
+    // Normalize and apply force: dir/dist * scale / dist^2 = dir * scale / dist^3
+    let dist = dist_sq.sqrt();
+    (dir * scale) / (dist * dist_sq).max(1.0)
 }
 
 enum Collision {
