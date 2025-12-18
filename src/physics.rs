@@ -276,8 +276,6 @@ impl Physics {
     }
 
     pub fn step(&mut self, dt: f32, share: &mut ShareData) {
-        let step_start = Instant::now();
-
         // Adaptive time-stepping
         let effective_dt = if self.use_adaptive_dt {
             self.compute_adaptive_dt()
@@ -310,7 +308,7 @@ impl Physics {
 
     fn integrate(&mut self, dt: f32, share: &mut ShareData) {
         let start = Instant::now();
-        let mut max_velocity = 0.0;
+        let mut max_velocity: f32 = 0.0;
 
         for i in 0..share.c_pos.len() {
             let c_pos = &mut share.c_pos[i];
@@ -337,7 +335,7 @@ impl Physics {
     }
 
     fn check_ball_collisions(&mut self, c_pos: &mut [Vec2]) {
-        let collision_start = Instant::now();
+        let _collision_start = Instant::now();
 
         // Use Barnes-Hut for force calculation if enabled
         if self.use_barnes_hut {
@@ -351,13 +349,9 @@ impl Physics {
             self.resolve_collisions(c_pos);
             self.check_wall_collisions(c_pos);
         }
-
-        let collision_time = collision_start.elapsed();
     }
 
     fn compute_forces_barnes_hut(&mut self, c_pos: &[Vec2]) {
-        let tree_start = Instant::now();
-
         // Build Barnes-Hut tree
         let bounds = AABB::new(
             Vec2::new(LEFT_WALL, BOTTOM_WALL),
@@ -369,21 +363,14 @@ impl Physics {
             tree.insert(pos, 1.0, i); // Assume unit mass for all particles
         }
 
-        let tree_build_time = tree_start.elapsed();
-
         // Compute forces using the tree
-        let force_start = Instant::now();
         for i in 0..c_pos.len() {
             let force = tree.compute_force(c_pos[i], self.scale, BARNES_HUT_THETA);
             self.c_force[i] += force / 8.0;
         }
-
-        // Note: Performance stats will be set in a mutable ShareData later
     }
 
     fn compute_forces_naive(&mut self, c_pos: &[Vec2]) {
-        let force_start = Instant::now();
-
         // Use spatial hashing as before
         if self.use_verlet_lists && self.should_rebuild_neighbors() {
             self.rebuild_neighbor_lists(c_pos);
@@ -402,8 +389,6 @@ impl Physics {
     }
 
     fn rebuild_neighbor_lists(&mut self, c_pos: &[Vec2]) {
-        let rebuild_start = Instant::now();
-
         // Resize neighbor lists if needed
         self.neighbor_lists.resize_with(c_pos.len(), NeighborList::new);
 
