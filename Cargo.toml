@@ -12,3 +12,7 @@ rand = "0.8.5"
 [[bench]]
 name = "physics_bench"
 harness = false
+
+[[bench]]
+name = "full_benchmark"
+harness = false
