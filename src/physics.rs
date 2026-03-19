@@ -25,12 +25,6 @@ pub struct ShareData {
     pub phys_time: f32,
 }
 
-fn arbitrary_vector_field(mut pos: Vec2) -> Vec2 {
-    pos *= 0.01;
-    let dx = pos.x.sin();
-    let dy = pos.y.cos() * 10.0;
-    Vec2::new(dx, dy).perp() * 0.0 // dirty way of disabling it
-}
 
 pub struct Physics {
     c_opos: Vec<Vec2>,
@@ -77,7 +71,7 @@ impl Physics {
             *c_color = (velocity.length() + 198.) % 360.;
 
             *c_pos =
-                *c_pos * 2.0 - *c_opos + (arbitrary_vector_field(*c_pos) + GRAVITY + *c_force) * dt;
+                *c_pos * 2.0 - *c_opos + (GRAVITY + *c_force) * dt;
             *c_opos = oldnpos;
             *c_force = Vec2::ZERO;
         }
