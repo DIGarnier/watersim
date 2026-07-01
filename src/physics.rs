@@ -271,8 +271,7 @@ impl BhTree {
                     continue;
                 }
                 // == normalize(diff) * scale * mass / max(dist², 1)
-                let inv_dist = dist_sq.sqrt().recip();
-                force += diff * (scale * n.total_mass * inv_dist / dist_sq.max(1.0));
+                force += diff * (scale * n.total_mass * fast_rsqrt(dist_sq) / dist_sq.max(1.0));
             } else if n.children != BH_NONE {
                 let c = n.children;
                 stack.extend_from_slice(&[c, c + 1, c + 2, c + 3]);
@@ -284,8 +283,7 @@ impl BhTree {
                     let d_sq = diff.length_squared();
                     // Skip self-interaction and touching particles
                     if d_sq >= BALL_SIZE * BALL_SIZE {
-                        let inv_dist = d_sq.sqrt().recip();
-                        force += diff * (scale * inv_dist / d_sq.max(1.0));
+                        force += diff * (scale * fast_rsqrt(d_sq) / d_sq.max(1.0));
                     }
                     p = self.next[p as usize];
                 }
@@ -368,9 +366,10 @@ impl CsrGrid {
 
     #[inline(always)]
     fn cell_id(pos: Vec2) -> u32 {
+        const INV_GRID_SIZE: f32 = 1.0 / GRID_SIZE;
         // `as usize` saturates negatives to 0, matching the old clamping
-        let x = ((pos.x / GRID_SIZE) as usize).min(GRID_W - 1);
-        let y = ((pos.y / GRID_SIZE) as usize).min(GRID_H - 1);
+        let x = ((pos.x * INV_GRID_SIZE) as usize).min(GRID_W - 1);
+        let y = ((pos.y * INV_GRID_SIZE) as usize).min(GRID_H - 1);
         (y * GRID_W + x) as u32
     }
 
@@ -417,6 +416,23 @@ impl CsrGrid {
     }
 }
 
+/// Hardware reciprocal square root (SSE `rsqrtss`, ~12-bit) refined with one
+/// Newton-Raphson step to ~22 bits — plenty for force directions and contact
+/// normals, and much cheaper than `sqrt` + `div`. Callers must keep x > 0.
+#[inline(always)]
+fn fast_rsqrt(x: f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::{_mm_cvtss_f32, _mm_rsqrt_ss, _mm_set_ss};
+        let y = unsafe { _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x))) };
+        y * (1.5 - 0.5 * x * y * y)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        x.sqrt().recip()
+    }
+}
+
 /// Raw pointer that rayon closures may capture. Every use is guarded by a
 /// partitioning argument (cell coloring / per-cell ownership) documented at
 /// the use site.
@@ -432,13 +448,6 @@ impl<T> SendPtr<T> {
     fn get(self) -> *mut T {
         self.0
     }
-}
-
-fn arbitrary_vector_field(mut pos: Vec2) -> Vec2 {
-    pos *= 0.01;
-    let dx = pos.x.sin();
-    let dy = pos.y.cos() * 10.0;
-    Vec2::new(dx, dy).perp() * 0.0 // dirty way of disabling it
 }
 
 pub struct Physics {
@@ -533,29 +542,37 @@ impl Physics {
 
     fn integrate(&mut self, dt: f32, share: &mut ShareData) {
         let start = Instant::now();
-        let mut max_velocity: f32 = 0.0;
+        let mut max_velocity_sq: f32 = 0.0;
+
+        // Colors are only consumed by the 60 Hz renderer; recomputing them
+        // (one sqrt + fmod per particle) on all 8 substeps per frame is waste.
+        let update_colors = self.frame_count % 8 == 0;
 
         for i in 0..share.c_pos.len() {
             let c_pos = &mut share.c_pos[i];
             let c_opos = &mut self.c_opos[i];
-            let c_color = &mut share.c_color[i];
             let c_force = &mut self.c_force[i];
 
             let oldnpos = *c_pos;
             let velocity = (*c_pos - *c_opos) * 20.;
-            let vel_length = velocity.length();
-            *c_color = (vel_length + 198.) % 360.;
+            let vel_sq = velocity.length_squared();
+
+            if update_colors {
+                share.c_color[i] = (vel_sq.sqrt() + 198.) % 360.;
+            }
 
             // Track maximum velocity for adaptive time-stepping
-            max_velocity = max_velocity.max(vel_length);
+            max_velocity_sq = max_velocity_sq.max(vel_sq);
 
-            *c_pos =
-                *c_pos * 2.0 - *c_opos + (arbitrary_vector_field(*c_pos) + GRAVITY + *c_force) * dt;
+            // NOTE: the old code also added arbitrary_vector_field(pos) here,
+            // which is defined to return exactly ZERO (`* 0.0`) but still paid
+            // a sin + cos per particle per substep.
+            *c_pos = *c_pos * 2.0 - *c_opos + (GRAVITY + *c_force) * dt;
             *c_opos = oldnpos;
             *c_force = Vec2::ZERO;
         }
 
-        self.last_max_velocity = max_velocity;
+        self.last_max_velocity = max_velocity_sq.sqrt();
         share.perf_stats.integration_time_us = start.elapsed().as_micros() as u64;
     }
 
@@ -813,31 +830,41 @@ impl Physics {
         }
     }
 
+    /// Half the positional correction for an overlapping pair, or None for
+    /// the common non-overlapping case — callers must skip the position
+    /// stores entirely then (most checked pairs don't collide, and the write
+    /// traffic of applying a ZERO correction measurably costs). One rsqrt
+    /// replaces the old length() + try_normalize() (two sqrts).
+    #[inline(always)]
+    fn pair_correction(pos_a: Vec2, pos_b: Vec2) -> Option<Vec2> {
+        const CONTACT: f32 = BALL_SIZE + BALL_SIZE;
+        let col_axis = pos_a - pos_b;
+        let dist_sq = col_axis.length_squared();
+        // Degenerate coincident pair: old try_normalize() produced ZERO.
+        if dist_sq >= CONTACT * CONTACT || dist_sq < 1e-12 {
+            return None;
+        }
+        let inv_dist = fast_rsqrt(dist_sq);
+        let dist = dist_sq * inv_dist;
+        // == normalized(col_axis) * 0.75 * (dist - CONTACT) / 2
+        Some(col_axis * (inv_dist * 0.375 * (dist - CONTACT)))
+    }
+
     /// Safety: caller must guarantee no other thread concurrently accesses
     /// positions i, j (ensured by the 6-coloring of cells).
     #[inline(always)]
     unsafe fn project_pair_raw(p: *mut Vec2, i: usize, j: usize) {
-        let pos_a = *p.add(i);
-        let pos_b = *p.add(j);
-        if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
-            let mut col_axis = pos_a - pos_b;
-            let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
-            col_axis = col_axis.try_normalize().unwrap_or(Vec2::ZERO);
-            *p.add(i) -= col_axis * mvt / 2.0;
-            *p.add(j) += col_axis * mvt / 2.0;
+        if let Some(corr) = Self::pair_correction(*p.add(i), *p.add(j)) {
+            *p.add(i) -= corr;
+            *p.add(j) += corr;
         }
     }
 
     #[inline(always)]
     fn project_pair(c_pos: &mut [Vec2], i: usize, j: usize) {
-        let pos_a = c_pos[i];
-        let pos_b = c_pos[j];
-        if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
-            let mut col_axis = pos_a - pos_b;
-            let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
-            col_axis = col_axis.try_normalize().unwrap_or(Vec2::ZERO);
-            c_pos[i] -= col_axis * mvt / 2.0;
-            c_pos[j] += col_axis * mvt / 2.0;
+        if let Some(corr) = Self::pair_correction(c_pos[i], c_pos[j]) {
+            c_pos[i] -= corr;
+            c_pos[j] += corr;
         }
     }
 
@@ -974,19 +1001,15 @@ impl Physics {
 }
 
 #[inline(always)]
-fn ball_collides(pos_a: Vec2, scale_a: f32, pos_b: Vec2, scale_b: f32) -> bool {
-    (pos_a - pos_b).length_squared() < ((scale_a + scale_b) * (scale_a + scale_b))
-}
-
-#[inline(always)]
 fn force(pos_a: Vec2, pos_b: Vec2, scale: f32) -> Vec2 {
     let dir = pos_a - pos_b;
-    let dist = dir.length();
-    if dist < BALL_SIZE {
+    let dist_sq = dir.length_squared();
+    if dist_sq < BALL_SIZE * BALL_SIZE {
         return Vec2::ZERO;
     }
 
-    (dir.normalize() * scale) / (dist * dist).max(1.0)
+    // == normalize(dir) * scale / max(dist², 1), with one rsqrt total
+    dir * (scale * fast_rsqrt(dist_sq) / dist_sq.max(1.0))
 }
 
 enum Collision {
