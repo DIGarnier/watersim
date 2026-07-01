@@ -1,5 +1,6 @@
 pub mod constants;
 pub mod physics;
+pub mod simd_physics;
 
 use std::path;
 use std::sync::mpsc::{channel, Sender};
@@ -59,6 +60,9 @@ fn main() -> GameResult {
                         Scale(scale) => {
                             physics.scale += scale;
                         }
+                        ToggleBarnesHut => physics.toggle_barnes_hut(),
+                        ToggleVerletLists => physics.toggle_verlet_lists(),
+                        ToggleAdaptiveDt => physics.toggle_adaptive_dt(),
                     }
                 }
 
@@ -169,6 +173,10 @@ impl event::EventHandler<ggez::GameError> for MainState {
         match input.keycode {
             Some(VirtualKeyCode::W) => self.tx.send(EventToPthread::Scale(SCALER)).unwrap(),
             Some(VirtualKeyCode::S) => self.tx.send(EventToPthread::Scale(-SCALER)).unwrap(),
+            // Toggle optimization techniques
+            Some(VirtualKeyCode::B) => self.tx.send(EventToPthread::ToggleBarnesHut).unwrap(),
+            Some(VirtualKeyCode::V) => self.tx.send(EventToPthread::ToggleVerletLists).unwrap(),
+            Some(VirtualKeyCode::A) => self.tx.send(EventToPthread::ToggleAdaptiveDt).unwrap(),
             _ => (),
         };
 
@@ -230,7 +238,37 @@ impl event::EventHandler<ggez::GameError> for MainState {
 
         let fps = ctx.time.fps();
         let nb_obj = self.nb_obj;
-        let fps_display = Text::new(format!("FPS: {fps}\nnb obj: {nb_obj}"));
+
+        // Get performance stats from share data
+        let perf_stats = if let Ok(share) = self.share.lock() {
+            share.perf_stats.clone()
+        } else {
+            Default::default()
+        };
+
+        let fps_display = Text::new(format!(
+            "FPS: {fps} | Particles: {nb_obj}\n\
+            \n\
+            Optimizations:\n\
+            [B] Barnes-Hut: {}\n\
+            [V] Verlet Lists: {}\n\
+            [A] Adaptive dt: {}\n\
+            \n\
+            Performance:\n\
+            Integration: {}µs\n\
+            Collision: {}µs\n\
+            Current dt: {:.6}s\n\
+            \n\
+            Controls:\n\
+            [W/S] Adjust force scale\n\
+            Mouse drag: Add particles",
+            if perf_stats.barnes_hut_enabled { "ON" } else { "OFF" },
+            if perf_stats.verlet_lists_enabled { "ON" } else { "OFF" },
+            if perf_stats.adaptive_dt_enabled { "ON" } else { "OFF" },
+            perf_stats.integration_time_us,
+            perf_stats.collision_time_us,
+            perf_stats.current_dt,
+        ));
 
         canvas.draw(
             &fps_display,
