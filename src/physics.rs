@@ -11,8 +11,12 @@ const GRAVITY: Vec2 = Vec2::new(0.0, 9.8);
 pub const PHYS_TIME_STEP: f32 = 1.0 / 480.0;
 
 // Optimization constants
-const VERLET_REBUILD_INTERVAL: usize = 10; // Rebuild neighbor lists every N frames
 const VERLET_SKIN_DISTANCE: f32 = BALL_SIZE * 0.5; // Extra distance for neighbor lists
+// When neighbor lists have gone stale (something moved > skin/2), forces fall
+// back to the direct cell pass — which costs the same as the rebuild gather —
+// and a rebuild is only re-attempted this often, in case the system calmed
+// down enough for lists to stay valid again ("lazy Verlet").
+const VERLET_REBUILD_RETRY: usize = 16;
 const ADAPTIVE_DT_MIN: f32 = PHYS_TIME_STEP * 0.1;
 const ADAPTIVE_DT_MAX: f32 = PHYS_TIME_STEP * 2.0;
 const MAX_SAFE_VELOCITY: f32 = 100.0; // Reduce dt when velocities exceed this
@@ -286,18 +290,38 @@ impl BhTree {
     }
 }
 
-// Verlet neighbor list for a particle
-struct NeighborList {
-    neighbors: Vec<usize>,
-    last_pos: Vec2,
+/// Verlet neighbor lists in flat CSR layout: one contiguous `neighbors` array
+/// with per-particle `start` offsets, instead of a Vec per particle. Rebuilt
+/// only when some particle has drifted more than half the skin distance from
+/// its position at build time (`ref_pos`) — the standard MD policy, which is
+/// both cheaper at rest and, unlike the old fixed every-10-frames cadence,
+/// can't miss fast-moving pairs.
+#[derive(Default)]
+struct VerletLists {
+    start: Vec<u32>,     // n+1 offsets into `neighbors`
+    neighbors: Vec<u32>, // flat neighbor ids
+    ref_pos: Vec<Vec2>,  // positions when the lists were built
 }
 
-impl NeighborList {
-    fn new() -> Self {
-        Self {
-            neighbors: Vec::new(),
-            last_pos: Vec2::ZERO,
+impl VerletLists {
+    #[inline(always)]
+    fn of(&self, i: usize) -> &[u32] {
+        &self.neighbors[self.start[i] as usize..self.start[i + 1] as usize]
+    }
+
+    fn is_valid_for(&self, n: usize) -> bool {
+        self.start.len() == n + 1
+    }
+
+    fn needs_rebuild(&self, c_pos: &[Vec2]) -> bool {
+        if !self.is_valid_for(c_pos.len()) {
+            return true;
         }
+        let limit_sq = (VERLET_SKIN_DISTANCE * 0.5) * (VERLET_SKIN_DISTANCE * 0.5);
+        c_pos
+            .iter()
+            .zip(&self.ref_pos)
+            .any(|(p, r)| (*p - *r).length_squared() > limit_sq)
     }
 }
 
@@ -420,7 +444,8 @@ pub struct Physics {
     pub scale: f32,
 
     // Optimization structures
-    neighbor_lists: Vec<NeighborList>,
+    neighbor_lists: VerletLists,
+    stale_steps: usize,
     frame_count: usize,
     use_barnes_hut: bool,
     use_verlet_lists: bool,
@@ -445,7 +470,8 @@ impl Physics {
             bh_tree: BhTree::new(),
             rx,
             scale,
-            neighbor_lists: Vec::new(),
+            neighbor_lists: VerletLists::default(),
+            stale_steps: 0,
             frame_count: 0,
             use_barnes_hut: true,  // Enable Barnes-Hut by default
             use_verlet_lists: true, // Enable Verlet lists by default
@@ -565,33 +591,39 @@ impl Physics {
     }
 
     fn compute_forces_naive(&mut self, c_pos: &[Vec2]) {
-        // Use spatial hashing as before
-        if self.use_verlet_lists && self.should_rebuild_neighbors() {
-            self.rebuild_neighbor_lists(c_pos);
+        if self.use_verlet_lists {
+            if !self.neighbor_lists.needs_rebuild(c_pos) {
+                self.stale_steps = 0;
+                self.compute_forces_with_verlet_lists(c_pos);
+                return;
+            }
+            // Lists are stale. Rebuilding every step under fast motion costs
+            // more than the direct cell pass, so only re-attempt list mode
+            // periodically; otherwise take the direct path this step.
+            self.stale_steps += 1;
+            if self.stale_steps >= VERLET_REBUILD_RETRY {
+                self.stale_steps = 0;
+                self.rebuild_neighbor_lists(c_pos);
+                self.compute_forces_with_verlet_lists(c_pos);
+                return;
+            }
         }
-
-        if self.use_verlet_lists && !self.neighbor_lists.is_empty() {
-            self.compute_forces_with_verlet_lists(c_pos);
-        } else {
-            self.compute_forces_with_spatial_hash(c_pos);
-        }
-    }
-
-    fn should_rebuild_neighbors(&self) -> bool {
-        self.frame_count % VERLET_REBUILD_INTERVAL == 0 ||
-        self.neighbor_lists.len() != self.c_force.len()
+        self.compute_forces_with_spatial_hash(c_pos);
     }
 
     fn rebuild_neighbor_lists(&mut self, c_pos: &[Vec2]) {
-        // Resize neighbor lists if needed
-        self.neighbor_lists.resize_with(c_pos.len(), NeighborList::new);
+        // The step-level CSR grid is already built; gather from it into the
+        // flat CSR lists (built in particle order, so a single append pass).
+        let lists = &mut self.neighbor_lists;
+        lists.start.resize(c_pos.len() + 1, 0);
+        lists.neighbors.clear();
+        lists.ref_pos.clear();
+        lists.ref_pos.extend_from_slice(c_pos);
 
-        // The step-level CSR grid is already built; gather from it.
         let interaction_range_sq =
             (BALL_SIZE * 2.0 + VERLET_SKIN_DISTANCE) * (BALL_SIZE * 2.0 + VERLET_SKIN_DISTANCE);
         for i in 0..c_pos.len() {
-            self.neighbor_lists[i].neighbors.clear();
-            self.neighbor_lists[i].last_pos = c_pos[i];
+            lists.start[i] = lists.neighbors.len() as u32;
 
             let cell = self.grid.cell_of[i] as usize;
             let (x, y) = (cell % GRID_W, cell / GRID_W);
@@ -607,16 +639,17 @@ impl Physics {
                         continue;
                     }
                     for &j in self.grid.cell(ny as usize * GRID_W + nx as usize) {
-                        let j = j as usize;
-                        if i != j
-                            && (c_pos[i] - c_pos[j]).length_squared() < interaction_range_sq
+                        if i != j as usize
+                            && (c_pos[i] - c_pos[j as usize]).length_squared()
+                                < interaction_range_sq
                         {
-                            self.neighbor_lists[i].neighbors.push(j);
+                            lists.neighbors.push(j);
                         }
                     }
                 }
             }
         }
+        lists.start[c_pos.len()] = lists.neighbors.len() as u32;
     }
 
     fn compute_forces_with_verlet_lists(&mut self, c_pos: &[Vec2]) {
@@ -627,14 +660,15 @@ impl Physics {
             let (c_force, lists, scale) = (&mut self.c_force, &self.neighbor_lists, self.scale);
             c_force.par_iter_mut().enumerate().for_each(|(i, f)| {
                 let mut acc = Vec2::ZERO;
-                for &j in &lists[i].neighbors {
-                    acc += force(c_pos[i], c_pos[j], scale);
+                for &j in lists.of(i) {
+                    acc += force(c_pos[i], c_pos[j as usize], scale);
                 }
                 *f += acc / 8.0;
             });
         } else {
             for i in 0..c_pos.len() {
-                for &j in &self.neighbor_lists[i].neighbors {
+                for &j in self.neighbor_lists.of(i) {
+                    let j = j as usize;
                     if i < j {
                         let f = force(c_pos[i], c_pos[j], self.scale) / 8.0;
                         self.c_force[i] += f;
