@@ -55,15 +55,6 @@ pub struct PerformanceStats {
     pub current_dt: f32,
 }
 
-// Barnes-Hut Quadtree node
-struct QuadNode {
-    bounds: AABB,
-    center_of_mass: Vec2,
-    total_mass: f32,
-    particle_idx: Option<usize>,
-    children: Option<Box<[QuadNode; 4]>>,
-}
-
 #[derive(Clone, Copy)]
 struct AABB {
     min: Vec2,
@@ -83,11 +74,6 @@ impl AABB {
         (self.max.x - self.min.x).max(self.max.y - self.min.y)
     }
 
-    fn contains(&self, point: Vec2) -> bool {
-        point.x >= self.min.x && point.x <= self.max.x &&
-        point.y >= self.min.y && point.y <= self.max.y
-    }
-
     fn quadrant(&self, idx: usize) -> AABB {
         let center = self.center();
         match idx {
@@ -100,106 +86,186 @@ impl AABB {
     }
 }
 
-impl QuadNode {
-    fn new(bounds: AABB) -> Self {
+const BH_NONE: u32 = u32::MAX;
+
+// Barnes-Hut quadtree node stored in a flat arena. `children` is the index of
+// the first of 4 contiguous children, or BH_NONE for a leaf.
+// Max particles per leaf before it subdivides. Bucketed leaves keep the tree
+// shallow and turn near-field work into tight exact loops (standard treecode
+// practice; see docs/literature.md §3).
+const BH_LEAF_CAP: u32 = 8;
+
+#[derive(Clone, Copy)]
+struct BhNode {
+    bounds: AABB,
+    center_of_mass: Vec2,
+    total_mass: f32,
+    size_sq: f32, // bounds.size()² cached for the sqrt-free acceptance test
+    children: u32, // BH_NONE = leaf, else index of first of 4 contiguous children
+    first: u32,    // head of this leaf's particle list (BH_NONE when empty)
+    count: u32,    // particles in this leaf
+}
+
+/// Arena-backed Barnes-Hut quadtree (Burtscher & Pingali 2011 style: contiguous
+/// node storage, no per-node allocation, non-recursive traversal). The arena,
+/// per-particle lists and traversal stack keep their capacity across frames,
+/// so steady-state tree builds are allocation-free.
+struct BhTree {
+    nodes: Vec<BhNode>,
+    next: Vec<u32>,  // per-particle intrusive list linking leaf members
+    ppos: Vec<Vec2>, // per-particle (clamped) position as inserted
+    stack: Vec<u32>,
+}
+
+impl BhTree {
+    fn new() -> Self {
         Self {
+            nodes: Vec::new(),
+            next: Vec::new(),
+            ppos: Vec::new(),
+            stack: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self, bounds: AABB, n_particles: usize) {
+        self.nodes.clear();
+        self.nodes.push(BhNode {
             bounds,
             center_of_mass: Vec2::ZERO,
             total_mass: 0.0,
-            particle_idx: None,
-            children: None,
+            size_sq: bounds.size() * bounds.size(),
+            children: BH_NONE,
+            first: BH_NONE,
+            count: 0,
+        });
+        self.next.resize(n_particles, BH_NONE);
+        self.ppos.resize(n_particles, Vec2::ZERO);
+    }
+
+    #[inline(always)]
+    fn quadrant_index(bounds: &AABB, pos: Vec2) -> usize {
+        let c = bounds.center();
+        ((pos.y >= c.y) as usize) * 2 + ((pos.x >= c.x) as usize)
+    }
+
+    fn insert(&mut self, idx: u32, pos: Vec2, mass: f32) {
+        // Below this cell size, keep piling particles into the leaf instead of
+        // subdividing forever (guards against (near-)coincident particles).
+        const MIN_CELL: f32 = 1e-3;
+
+        self.ppos[idx as usize] = pos;
+        let mut node = 0usize;
+        loop {
+            let n = self.nodes[node];
+
+            if n.children != BH_NONE {
+                // Internal node: fold the new mass into the aggregate, descend.
+                let total = n.total_mass + mass;
+                self.nodes[node].center_of_mass =
+                    (n.center_of_mass * n.total_mass + pos * mass) / total;
+                self.nodes[node].total_mass = total;
+                node = n.children as usize + Self::quadrant_index(&n.bounds, pos);
+                continue;
+            }
+
+            if n.count < BH_LEAF_CAP || n.bounds.size() < MIN_CELL {
+                // Leaf with room: link the particle in and update the aggregate.
+                self.next[idx as usize] = n.first;
+                let total = n.total_mass + mass;
+                let nn = &mut self.nodes[node];
+                nn.first = idx;
+                nn.count = n.count + 1;
+                nn.center_of_mass = (n.center_of_mass * n.total_mass + pos * mass) / total;
+                nn.total_mass = total;
+                return;
+            }
+
+            // Full leaf: subdivide and redistribute the residents, then retry
+            // this node (now internal) with the incoming particle.
+            let first_child = self.nodes.len() as u32;
+            for q in 0..4 {
+                let qb = n.bounds.quadrant(q);
+                self.nodes.push(BhNode {
+                    bounds: qb,
+                    center_of_mass: Vec2::ZERO,
+                    total_mass: 0.0,
+                    size_sq: qb.size() * qb.size(),
+                    children: BH_NONE,
+                    first: BH_NONE,
+                    count: 0,
+                });
+            }
+
+            let mut p = n.first;
+            let per_particle_mass = n.total_mass / n.count as f32;
+            while p != BH_NONE {
+                let p_next = self.next[p as usize];
+                let p_pos = self.ppos[p as usize];
+                let child =
+                    first_child as usize + Self::quadrant_index(&n.bounds, p_pos);
+                let c = self.nodes[child];
+                self.next[p as usize] = c.first;
+                let total = c.total_mass + per_particle_mass;
+                let cn = &mut self.nodes[child];
+                cn.first = p;
+                cn.count = c.count + 1;
+                cn.center_of_mass =
+                    (c.center_of_mass * c.total_mass + p_pos * per_particle_mass) / total;
+                cn.total_mass = total;
+                p = p_next;
+            }
+
+            let nn = &mut self.nodes[node];
+            nn.children = first_child;
+            nn.first = BH_NONE;
+            nn.count = 0;
         }
     }
 
-    fn insert(&mut self, pos: Vec2, mass: f32, idx: usize) -> bool {
-        if !self.bounds.contains(pos) {
-            return false;
-        }
-
-        // If this is a leaf node with no particle, store it here
-        if self.particle_idx.is_none() && self.children.is_none() {
-            self.particle_idx = Some(idx);
-            self.center_of_mass = pos;
-            self.total_mass = mass;
-            return true;
-        }
-
-        // If this leaf already has a particle, subdivide
-        if self.particle_idx.is_some() && self.children.is_none() {
-            let old_idx = self.particle_idx.take().unwrap();
-            let old_com = self.center_of_mass;
-            let old_mass = self.total_mass;
-
-            // Create children
-            self.children = Some(Box::new([
-                QuadNode::new(self.bounds.quadrant(0)),
-                QuadNode::new(self.bounds.quadrant(1)),
-                QuadNode::new(self.bounds.quadrant(2)),
-                QuadNode::new(self.bounds.quadrant(3)),
-            ]));
-
-            // Re-insert old particle
-            for child in self.children.as_mut().unwrap().iter_mut() {
-                if child.insert(old_com, old_mass, old_idx) {
-                    break;
-                }
-            }
-        }
-
-        // Insert new particle into appropriate child
-        if let Some(ref mut children) = self.children {
-            for child in children.iter_mut() {
-                if child.insert(pos, mass, idx) {
-                    // Update center of mass and total mass
-                    let total = self.total_mass + mass;
-                    self.center_of_mass = (self.center_of_mass * self.total_mass + pos * mass) / total;
-                    self.total_mass = total;
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
-    fn compute_force(&self, pos: Vec2, scale: f32, theta: f32) -> Vec2 {
-        if self.total_mass == 0.0 {
-            return Vec2::ZERO;
-        }
-
-        let diff = self.center_of_mass - pos;
-        let dist_sq = diff.length_squared();
-
-        // Avoid self-interaction
-        if dist_sq < 0.01 {
-            return Vec2::ZERO;
-        }
-
-        let dist = dist_sq.sqrt();
-        let size = self.bounds.size();
-
-        // If far enough or is a leaf, use approximation
-        if self.children.is_none() || (size / dist) < theta {
-            if dist < BALL_SIZE {
-                return Vec2::ZERO;
-            }
-            return (diff.normalize() * scale * self.total_mass) / dist_sq.max(1.0);
-        }
-
-        // Otherwise, recurse into children
+    fn compute_force(&mut self, pos: Vec2, scale: f32, theta: f32) -> Vec2 {
+        let theta_sq = theta * theta;
         let mut force = Vec2::ZERO;
-        if let Some(ref children) = self.children {
-            for child in children.iter() {
-                force += child.compute_force(pos, scale, theta);
+        self.stack.clear();
+        self.stack.push(0);
+
+        while let Some(idx) = self.stack.pop() {
+            let n = &self.nodes[idx as usize];
+            if n.total_mass == 0.0 {
+                continue;
+            }
+
+            let diff = n.center_of_mass - pos;
+            let dist_sq = diff.length_squared();
+
+            // size/dist < theta  <=>  size² < theta²·dist², sqrt-free
+            if n.size_sq < theta_sq * dist_sq {
+                // Far enough: use the aggregate (internal or leaf alike).
+                if dist_sq < BALL_SIZE * BALL_SIZE {
+                    continue;
+                }
+                // == normalize(diff) * scale * mass / max(dist², 1)
+                let inv_dist = dist_sq.sqrt().recip();
+                force += diff * (scale * n.total_mass * inv_dist / dist_sq.max(1.0));
+            } else if n.children != BH_NONE {
+                let c = n.children;
+                self.stack.extend_from_slice(&[c, c + 1, c + 2, c + 3]);
+            } else {
+                // Near leaf: exact particle-particle interactions.
+                let mut p = n.first;
+                while p != BH_NONE {
+                    let diff = self.ppos[p as usize] - pos;
+                    let d_sq = diff.length_squared();
+                    // Skip self-interaction and touching particles
+                    if d_sq >= BALL_SIZE * BALL_SIZE {
+                        let inv_dist = d_sq.sqrt().recip();
+                        force += diff * (scale * inv_dist / d_sq.max(1.0));
+                    }
+                    p = self.next[p as usize];
+                }
             }
         }
-        force
-    }
 
-    fn count_nodes(&self) -> usize {
-        1 + self.children.as_ref()
-            .map(|c| c.iter().map(|child| child.count_nodes()).sum())
-            .unwrap_or(0)
+        force
     }
 }
 
@@ -304,6 +370,7 @@ pub struct Physics {
     c_opos: Vec<Vec2>,
     c_force: Vec<Vec2>,
     grid: CsrGrid,
+    bh_tree: BhTree,
     pub rx: Receiver<EventToPthread>,
     pub scale: f32,
 
@@ -330,6 +397,7 @@ impl Physics {
             c_opos,
             c_force,
             grid: CsrGrid::new(),
+            bh_tree: BhTree::new(),
             rx,
             scale,
             neighbor_lists: Vec::new(),
@@ -423,20 +491,25 @@ impl Physics {
     }
 
     fn compute_forces_barnes_hut(&mut self, c_pos: &[Vec2]) {
-        // Build Barnes-Hut tree
+        // Rebuild the arena tree (capacity persists across frames)
         let bounds = AABB::new(
             Vec2::new(LEFT_WALL, BOTTOM_WALL),
             Vec2::new(RIGHT_WALL, TOP_WALL),
         );
-        let mut tree = QuadNode::new(bounds);
+        self.bh_tree.clear(bounds, c_pos.len());
 
         for (i, &pos) in c_pos.iter().enumerate() {
-            tree.insert(pos, 1.0, i); // Assume unit mass for all particles
+            // The old tree silently dropped out-of-bounds particles; clamping
+            // keeps them contributing from the nearest edge instead.
+            self.bh_tree
+                .insert(i as u32, pos.clamp(bounds.min, bounds.max), 1.0);
         }
 
-        // Compute forces using the tree
-        for i in 0..c_pos.len() {
-            let force = tree.compute_force(c_pos[i], self.scale, BARNES_HUT_THETA);
+        // Walk particles in grid (spatial) order: neighbors traverse nearly the
+        // same tree nodes, so the upper tree stays hot in cache.
+        for k in 0..self.grid.indices.len() {
+            let i = self.grid.indices[k] as usize;
+            let force = self.bh_tree.compute_force(c_pos[i], self.scale, BARNES_HUT_THETA);
             self.c_force[i] += force / 8.0;
         }
     }
