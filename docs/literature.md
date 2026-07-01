@@ -64,6 +64,9 @@ an explicit-stack traversal.
 a division chain per pair); rewrite with one inverse-sqrt. Particle arrays are AoS
 `Vec2`, which is acceptable for 2D (8 bytes/particle ≈ SoA); the bigger win is
 iterating pairs in cell order (the CSR grid already gives near-sorted access).
+*Status: applied — hardware rsqrt kernels (benchmark 08), SFCPACK-style periodic
+array reordering (benchmark 07), and a hot/cold node split for the BH tree
+(benchmark 09). Lazy displacement-triggered Verlet rebuilds landed in benchmark 06.*
 
 ## 5. Multithreading
 
