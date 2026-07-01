@@ -31,13 +31,25 @@ The simulation displays real-time performance metrics:
 - Active optimization status
 - Current adaptive timestep
 
-See [OPTIMIZATIONS.md](OPTIMIZATIONS.md) for detailed documentation of all techniques.
+Measured performance and the full optimization history live in
+[docs/benchmarks/](docs/benchmarks/README.md); the techniques and the papers
+behind them are surveyed in [docs/literature.md](docs/literature.md).
 
 ## Building
 
 ```bash
 cargo build --release
 cargo run --release
+```
+
+## Benchmarking
+
+A headless benchmark drives the real physics engine (no graphics dependencies
+needed) across force paths and particle counts:
+
+```bash
+cargo bench --no-default-features --bench nbody          # full suite
+cargo bench --no-default-features --bench nbody -- --quick
 ```
 
 ## Architecture
@@ -50,9 +62,10 @@ cargo run --release
 ## References
 
 Based on research from:
-- Barnes & Hut (1986): Barnes-Hut algorithm
-- Verlet (1967): Neighbor lists for molecular dynamics
-- Recent GPU implementations (2025): 4 trillion interactions in 8ms
-- SIMD optimization techniques: 2-4x speedup with AVX2/AVX-512
+- Barnes & Hut (1986): hierarchical force approximation
+- Verlet (1967): neighbor lists for molecular dynamics
+- Green (2010) / Hoetzlein (2014): counting-sort uniform grids (CSR layout)
+- Burtscher & Pingali (2011): allocation-free flat treecodes
+- Macklin et al. (2019): "Small Steps in Physics Simulation"
 
-See OPTIMIZATIONS.md for complete references and implementation details.
+Full annotated bibliography with links: [docs/literature.md](docs/literature.md).

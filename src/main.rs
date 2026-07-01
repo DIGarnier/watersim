@@ -11,7 +11,7 @@ use ggez::graphics::{Color, DrawMode, DrawParam, Image, InstanceArray, Mesh, Tex
 
 use ggez::winit::event::VirtualKeyCode;
 use ggez::{event, graphics, Context, ContextBuilder, GameResult};
-use constants::{BALL_SIZE, HEIGHT, WIDTH, X_LEN, Y_LEN};
+use constants::{BALL_SIZE, HEIGHT, WIDTH};
 use physics::{EventToPthread, Physics, ShareData, PHYS_TIME_STEP};
 
 const BACKGROUND_COLOR: Color = Color::new(0., 0., 0., 0.0);
