@@ -157,7 +157,7 @@ fn main() {
     let configs: &[(usize, usize)] = if quick {
         &[(1_000, 120), (6_000, 40)]
     } else {
-        &[(1_000, 300), (3_000, 200), (6_000, 120), (12_000, 60)]
+        &[(1_000, 300), (3_000, 200), (6_000, 120), (12_000, 60), (24_000, 40)]
     };
 
     println!("| particles | force path | steps | mean µs/step | median | p95 | min | max | 480 Hz real-time? | max pen % | sane? |");

@@ -1,4 +1,5 @@
 use glam::Vec2;
+use rayon::prelude::*;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
@@ -23,6 +24,15 @@ const BARNES_HUT_THETA: f32 = 0.5; // Barnes-Hut approximation parameter
 // solver iterations, so a small count here suffices (see
 // docs/benchmarks/04-small-steps.md for the measured speed/quality trade).
 const SOLVER_ITERATIONS: usize = 4;
+
+// Below this particle count the serial grid paths win. Measured on a 4-core
+// Xeon: parallel force gather + colored solver are a ~2x win at 24k particles,
+// within noise at 12k, and a regression at 3-6k (the solver alone spawns
+// 6 colors x 4 iterations = 24 parallel regions per step, whose overhead
+// dominates small workloads). The Barnes-Hut traversal has no threshold: it
+// is one region of heavy independent work and wins at every tested size.
+const PAR_MIN_PARTICLES: usize = 16_000;
+const PAR_SOLVER_MIN_PARTICLES: usize = 16_000;
 
 const LEFT_WALL: f32 = 0.;
 const RIGHT_WALL: f32 = WIDTH;
@@ -121,7 +131,6 @@ struct BhTree {
     nodes: Vec<BhNode>,
     next: Vec<u32>,  // per-particle intrusive list linking leaf members
     ppos: Vec<Vec2>, // per-particle (clamped) position as inserted
-    stack: Vec<u32>,
 }
 
 impl BhTree {
@@ -130,7 +139,6 @@ impl BhTree {
             nodes: Vec::new(),
             next: Vec::new(),
             ppos: Vec::new(),
-            stack: Vec::new(),
         }
     }
 
@@ -229,13 +237,15 @@ impl BhTree {
         }
     }
 
-    fn compute_force(&mut self, pos: Vec2, scale: f32, theta: f32) -> Vec2 {
+    /// Traversal is read-only so it can run for many particles in parallel;
+    /// callers supply a reusable scratch stack (one per thread).
+    fn compute_force(&self, pos: Vec2, scale: f32, theta: f32, stack: &mut Vec<u32>) -> Vec2 {
         let theta_sq = theta * theta;
         let mut force = Vec2::ZERO;
-        self.stack.clear();
-        self.stack.push(0);
+        stack.clear();
+        stack.push(0);
 
-        while let Some(idx) = self.stack.pop() {
+        while let Some(idx) = stack.pop() {
             let n = &self.nodes[idx as usize];
             if n.total_mass == 0.0 {
                 continue;
@@ -255,7 +265,7 @@ impl BhTree {
                 force += diff * (scale * n.total_mass * inv_dist / dist_sq.max(1.0));
             } else if n.children != BH_NONE {
                 let c = n.children;
-                self.stack.extend_from_slice(&[c, c + 1, c + 2, c + 3]);
+                stack.extend_from_slice(&[c, c + 1, c + 2, c + 3]);
             } else {
                 // Near leaf: exact particle-particle interactions.
                 let mut p = n.first;
@@ -307,6 +317,11 @@ struct CsrGrid {
     cell_of: Vec<u32>,    // per-particle cell id
     indices: Vec<u32>,    // particle ids grouped by cell
     occupied: Vec<u32>,   // ids of non-empty cells, ascending
+    // Occupied cells split into 6 color classes for the parallel solver.
+    // Colors are (x mod 3) + 3·(y mod 2): with the forward half-stencil
+    // {E, SW, S, SE}, a cell's write region spans x±1 and y..y+1, so two
+    // same-color cells (Δx ≥ 3 or Δy ≥ 2) always touch disjoint particles.
+    color_buckets: [Vec<u32>; 6],
 }
 
 impl CsrGrid {
@@ -317,6 +332,7 @@ impl CsrGrid {
             cell_of: Vec::new(),
             indices: Vec::new(),
             occupied: Vec::new(),
+            color_buckets: Default::default(),
         }
     }
 
@@ -342,12 +358,17 @@ impl CsrGrid {
 
         let mut sum = 0u32;
         self.occupied.clear();
+        for bucket in &mut self.color_buckets {
+            bucket.clear();
+        }
         for c in 0..N_CELLS {
             let count = self.cursor[c];
             self.cell_start[c] = sum;
             self.cursor[c] = sum;
             if count > 0 {
                 self.occupied.push(c as u32);
+                let (x, y) = (c % GRID_W, c / GRID_W);
+                self.color_buckets[(x % 3) + 3 * (y % 2)].push(c as u32);
             }
             sum += count;
         }
@@ -363,6 +384,23 @@ impl CsrGrid {
     #[inline(always)]
     fn cell(&self, c: usize) -> &[u32] {
         &self.indices[self.cell_start[c] as usize..self.cell_start[c + 1] as usize]
+    }
+}
+
+/// Raw pointer that rayon closures may capture. Every use is guarded by a
+/// partitioning argument (cell coloring / per-cell ownership) documented at
+/// the use site.
+#[derive(Clone, Copy)]
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    // Accessor (rather than field access) so closures capture the whole
+    // wrapper, not the raw pointer, which would defeat the Send/Sync impls.
+    #[inline(always)]
+    fn get(self) -> *mut T {
+        self.0
     }
 }
 
@@ -512,13 +550,18 @@ impl Physics {
                 .insert(i as u32, pos.clamp(bounds.min, bounds.max), 1.0);
         }
 
-        // Walk particles in grid (spatial) order: neighbors traverse nearly the
-        // same tree nodes, so the upper tree stays hot in cache.
-        for k in 0..self.grid.indices.len() {
-            let i = self.grid.indices[k] as usize;
-            let force = self.bh_tree.compute_force(c_pos[i], self.scale, BARNES_HUT_THETA);
-            self.c_force[i] += force / 8.0;
-        }
+        // Independent read-only traversals: parallelize over particles with a
+        // per-thread scratch stack.
+        let (tree, scale) = (&self.bh_tree, self.scale);
+        self.c_force
+            .par_iter_mut()
+            .enumerate()
+            .for_each_init(
+                || Vec::with_capacity(256),
+                |stack, (i, f)| {
+                    *f += tree.compute_force(c_pos[i], scale, BARNES_HUT_THETA, stack) / 8.0;
+                },
+            );
     }
 
     fn compute_forces_naive(&mut self, c_pos: &[Vec2]) {
@@ -577,18 +620,70 @@ impl Physics {
     }
 
     fn compute_forces_with_verlet_lists(&mut self, c_pos: &[Vec2]) {
-        for i in 0..c_pos.len() {
-            for &j in &self.neighbor_lists[i].neighbors {
-                if i < j {
-                    let f = force(c_pos[i], c_pos[j], self.scale) / 8.0;
-                    self.c_force[i] += f;
-                    self.c_force[j] -= f; // Newton's third law
+        if c_pos.len() >= PAR_MIN_PARTICLES {
+            // Parallel gather: each particle sums its full (symmetric) neighbor
+            // list, so no cross-thread writes. Twice the arithmetic of the
+            // Newton's-third-law scatter, but it parallelizes cleanly.
+            let (c_force, lists, scale) = (&mut self.c_force, &self.neighbor_lists, self.scale);
+            c_force.par_iter_mut().enumerate().for_each(|(i, f)| {
+                let mut acc = Vec2::ZERO;
+                for &j in &lists[i].neighbors {
+                    acc += force(c_pos[i], c_pos[j], scale);
+                }
+                *f += acc / 8.0;
+            });
+        } else {
+            for i in 0..c_pos.len() {
+                for &j in &self.neighbor_lists[i].neighbors {
+                    if i < j {
+                        let f = force(c_pos[i], c_pos[j], self.scale) / 8.0;
+                        self.c_force[i] += f;
+                        self.c_force[j] -= f; // Newton's third law
+                    }
                 }
             }
         }
     }
 
     fn compute_forces_with_spatial_hash(&mut self, c_pos: &[Vec2]) {
+        if c_pos.len() >= PAR_MIN_PARTICLES {
+            // Parallel over occupied cells: each cell gathers forces for its
+            // own particles from the full 3×3 neighborhood, so force writes
+            // are disjoint across cells.
+            let (grid, scale) = (&self.grid, self.scale);
+            let c_force = SendPtr(self.c_force.as_mut_ptr());
+            grid.occupied.par_iter().for_each(|&cell| {
+                let cell = cell as usize;
+                let (x, y) = (cell % GRID_W, cell / GRID_W);
+                for &i in grid.cell(cell) {
+                    let i = i as usize;
+                    let mut acc = Vec2::ZERO;
+                    for dy in -1i32..=1 {
+                        let ny = y as i32 + dy;
+                        if ny < 0 || ny >= GRID_H as i32 {
+                            continue;
+                        }
+                        for dx in -1i32..=1 {
+                            let nx = x as i32 + dx;
+                            if nx < 0 || nx >= GRID_W as i32 {
+                                continue;
+                            }
+                            for &j in grid.cell(ny as usize * GRID_W + nx as usize) {
+                                let j = j as usize;
+                                if i != j {
+                                    acc += force(c_pos[i], c_pos[j], scale);
+                                }
+                            }
+                        }
+                    }
+                    // Safety: cell membership partitions particles, so no other
+                    // thread writes c_force[i].
+                    unsafe { *c_force.get().add(i) += acc / 8.0 };
+                }
+            });
+            return;
+        }
+
         // Half-neighborhood sweep over occupied CSR cells: each unordered cell
         // pair is visited once and Newton's third law is applied per pair.
         for oc in 0..self.grid.occupied.len() {
@@ -626,6 +721,21 @@ impl Physics {
         }
     }
 
+    /// Safety: caller must guarantee no other thread concurrently accesses
+    /// positions i, j (ensured by the 6-coloring of cells).
+    #[inline(always)]
+    unsafe fn project_pair_raw(p: *mut Vec2, i: usize, j: usize) {
+        let pos_a = *p.add(i);
+        let pos_b = *p.add(j);
+        if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
+            let mut col_axis = pos_a - pos_b;
+            let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
+            col_axis = col_axis.try_normalize().unwrap_or(Vec2::ZERO);
+            *p.add(i) -= col_axis * mvt / 2.0;
+            *p.add(j) += col_axis * mvt / 2.0;
+        }
+    }
+
     #[inline(always)]
     fn project_pair(c_pos: &mut [Vec2], i: usize, j: usize) {
         let pos_a = c_pos[i];
@@ -640,6 +750,43 @@ impl Physics {
     }
 
     fn resolve_collisions(&mut self, c_pos: &mut [Vec2]) {
+        if c_pos.len() >= PAR_SOLVER_MIN_PARTICLES {
+            // Parallel constraint projection via cell coloring: the 6 color
+            // classes are processed sequentially, cells within a class in
+            // parallel — same-color cells touch disjoint particles (see
+            // CsrGrid::color_buckets), so the raw-pointer writes never race.
+            let grid = &self.grid;
+            let pos_ptr = SendPtr(c_pos.as_mut_ptr());
+            for bucket in &grid.color_buckets {
+                bucket.par_iter().for_each(|&cell| {
+                    let cell = cell as usize;
+                    let (x, y) = (cell % GRID_W, cell / GRID_W);
+                    let currents = grid.cell(cell);
+                    let p = pos_ptr.get();
+                    unsafe {
+                        for a in 0..currents.len() {
+                            let i = currents[a] as usize;
+                            for b in a + 1..currents.len() {
+                                Self::project_pair_raw(p, i, currents[b] as usize);
+                            }
+                        }
+                        for (dx, dy) in [(1i32, 0i32), (-1, 1), (0, 1), (1, 1)] {
+                            let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                            if nx < 0 || nx >= GRID_W as i32 || ny >= GRID_H as i32 {
+                                continue;
+                            }
+                            for &i in currents {
+                                for &j in grid.cell(ny as usize * GRID_W + nx as usize) {
+                                    Self::project_pair_raw(p, i as usize, j as usize);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            return;
+        }
+
         // Sweep only occupied cells of the step-level CSR grid, visiting each
         // unordered cell pair once via the forward half-stencil. Reusing the
         // grid across solver iterations is safe: a particle moves far less
