@@ -17,6 +17,13 @@ const ADAPTIVE_DT_MAX: f32 = PHYS_TIME_STEP * 2.0;
 const MAX_SAFE_VELOCITY: f32 = 100.0; // Reduce dt when velocities exceed this
 const BARNES_HUT_THETA: f32 = 0.5; // Barnes-Hut approximation parameter
 
+// Constraint-projection iterations per substep. The sim already substeps at
+// 480 Hz (8 substeps per 60 Hz visual frame); per "Small Steps in Physics
+// Simulation" (Macklin et al., SCA 2019) substeps are far more valuable than
+// solver iterations, so a small count here suffices (see
+// docs/benchmarks/04-small-steps.md for the measured speed/quality trade).
+const SOLVER_ITERATIONS: usize = 4;
+
 const LEFT_WALL: f32 = 0.;
 const RIGHT_WALL: f32 = WIDTH;
 const BOTTOM_WALL: f32 = 0.;
@@ -484,7 +491,7 @@ impl Physics {
         }
 
         // Handle collisions using constraint solver
-        for _ in 0..8 {
+        for _ in 0..SOLVER_ITERATIONS {
             self.resolve_collisions(c_pos);
             self.check_wall_collisions(c_pos);
         }

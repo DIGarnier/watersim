@@ -43,6 +43,23 @@ struct RunResult {
     max_us: f64,
     nan_count: usize,
     escaped_count: usize,
+    max_penetration_pct: f64,
+}
+
+/// Worst pair overlap in the final state, as % of the contact distance
+/// (2·BALL_SIZE). Measures constraint-solver quality: lower is better.
+fn max_penetration_pct(positions: &[Vec2]) -> f64 {
+    let contact = 2.0 * BALL_SIZE;
+    let mut max_pen = 0.0f32;
+    for i in 0..positions.len() {
+        for j in i + 1..positions.len() {
+            let dist_sq = (positions[i] - positions[j]).length_squared();
+            if dist_sq < contact * contact {
+                max_pen = max_pen.max(contact - dist_sq.sqrt());
+            }
+        }
+    }
+    (max_pen / contact) as f64 * 100.0
 }
 
 /// Dense block of particles resting on the floor, spaced slightly apart so the
@@ -127,6 +144,7 @@ fn run_config(particles: usize, steps: usize, warmup: usize, path: ForcePath) ->
         max_us: step_times_us[steps - 1],
         nan_count,
         escaped_count,
+        max_penetration_pct: max_penetration_pct(&share.c_pos),
     }
 }
 
@@ -142,8 +160,8 @@ fn main() {
         &[(1_000, 300), (3_000, 200), (6_000, 120), (12_000, 60)]
     };
 
-    println!("| particles | force path | steps | mean µs/step | median | p95 | min | max | 480 Hz real-time? | sane? |");
-    println!("|---|---|---|---|---|---|---|---|---|---|");
+    println!("| particles | force path | steps | mean µs/step | median | p95 | min | max | 480 Hz real-time? | max pen % | sane? |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|");
 
     for &(particles, steps) in configs {
         for path in [ForcePath::BarnesHut, ForcePath::VerletLists, ForcePath::SpatialHash] {
@@ -155,10 +173,10 @@ fn main() {
                 format!("{} NaN, {} escaped", r.nan_count, r.escaped_count)
             };
             println!(
-                "| {} | {} | {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {} | {} |",
+                "| {} | {} | {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {} | {:.1} | {} |",
                 r.particles, r.path.label(), r.steps,
                 r.mean_us, r.median_us, r.p95_us, r.min_us, r.max_us,
-                realtime, sane,
+                realtime, r.max_penetration_pct, sane,
             );
         }
     }
