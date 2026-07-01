@@ -17,6 +17,12 @@ const VERLET_SKIN_DISTANCE: f32 = BALL_SIZE * 0.5; // Extra distance for neighbo
 // and a rebuild is only re-attempted this often, in case the system calmed
 // down enough for lists to stay valid again ("lazy Verlet").
 const VERLET_REBUILD_RETRY: usize = 16;
+
+// Physically permute the particle arrays into grid (spatial) order this often.
+// Keeps array neighbors ≈ spatial neighbors so the force/solver passes read
+// memory nearly sequentially (SFC reordering à la HOOMD-blue's SFCPACK;
+// docs/literature.md §4). O(n) copies, amortized to ~nothing.
+const REORDER_INTERVAL: usize = 64;
 const ADAPTIVE_DT_MIN: f32 = PHYS_TIME_STEP * 0.1;
 const ADAPTIVE_DT_MAX: f32 = PHYS_TIME_STEP * 2.0;
 const MAX_SAFE_VELOCITY: f32 = 100.0; // Reduce dt when velocities exceed this
@@ -446,6 +452,8 @@ pub struct Physics {
     // Optimization structures
     neighbor_lists: VerletLists,
     stale_steps: usize,
+    scratch_v2: Vec<Vec2>,
+    scratch_f: Vec<f32>,
     frame_count: usize,
     use_barnes_hut: bool,
     use_verlet_lists: bool,
@@ -472,6 +480,8 @@ impl Physics {
             scale,
             neighbor_lists: VerletLists::default(),
             stale_steps: 0,
+            scratch_v2: Vec::new(),
+            scratch_f: Vec::new(),
             frame_count: 0,
             use_barnes_hut: true,  // Enable Barnes-Hut by default
             use_verlet_lists: true, // Enable Verlet lists by default
@@ -490,6 +500,15 @@ impl Physics {
         };
 
         self.integrate(effective_dt, share);
+
+        // Build the CSR grid once per step; forces and all solver iterations
+        // reuse it (positions move a small fraction of a cell per step).
+        self.grid.build(&share.c_pos);
+
+        if self.frame_count % REORDER_INTERVAL == 0 {
+            self.reorder_particles(share);
+        }
+
         self.check_ball_collisions(&mut share.c_pos);
 
         self.frame_count += 1;
@@ -540,12 +559,51 @@ impl Physics {
         share.perf_stats.integration_time_us = start.elapsed().as_micros() as u64;
     }
 
+    /// Permute all per-particle arrays into grid order (the grid's `indices`
+    /// is exactly that permutation), then patch the grid back to identity.
+    fn reorder_particles(&mut self, share: &mut ShareData) {
+        let n = share.c_pos.len();
+        if n == 0 {
+            return;
+        }
+
+        let perm = &self.grid.indices;
+        let permute_v2 = |src: &mut Vec<Vec2>, scratch: &mut Vec<Vec2>| {
+            scratch.clear();
+            scratch.extend(perm.iter().map(|&p| src[p as usize]));
+            std::mem::swap(src, scratch);
+        };
+
+        permute_v2(&mut share.c_pos, &mut self.scratch_v2);
+        permute_v2(&mut self.c_opos, &mut self.scratch_v2);
+        permute_v2(&mut self.c_force, &mut self.scratch_v2);
+
+        self.scratch_f.clear();
+        self.scratch_f
+            .extend(perm.iter().map(|&p| share.c_color[p as usize]));
+        std::mem::swap(&mut share.c_color, &mut self.scratch_f);
+
+        // Grid order is now array order; cell assignments are unchanged.
+        for (k, (idx, cell)) in self
+            .grid
+            .indices
+            .iter_mut()
+            .zip(&mut self.grid.cell_of)
+            .enumerate()
+        {
+            *idx = k as u32;
+            *cell = CsrGrid::cell_id(share.c_pos[k]);
+        }
+
+        // Particle indices changed; stored neighbor lists are meaningless now.
+        // Prime the lazy-rebuild counter so list mode resumes on the very next
+        // force pass instead of waiting out the retry interval.
+        self.neighbor_lists.start.clear();
+        self.stale_steps = VERLET_REBUILD_RETRY - 1;
+    }
+
     fn check_ball_collisions(&mut self, c_pos: &mut [Vec2]) {
         let _collision_start = Instant::now();
-
-        // Build the CSR grid once per step; forces and all solver iterations
-        // reuse it (positions move a small fraction of a cell per step).
-        self.grid.build(c_pos);
 
         // Use Barnes-Hut for force calculation if enabled
         if self.use_barnes_hut {
