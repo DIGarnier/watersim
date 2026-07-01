@@ -9,7 +9,7 @@ use std::sync::mpsc::channel;
 use std::time::Instant;
 
 use glam::Vec2;
-use lolballs::constants::{BALL_SIZE, HEIGHT, WIDTH, X_LEN, Y_LEN};
+use lolballs::constants::{BALL_SIZE, HEIGHT, WIDTH};
 use lolballs::physics::{Physics, ShareData, PHYS_TIME_STEP};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -69,8 +69,6 @@ fn run_config(particles: usize, steps: usize, warmup: usize, path: ForcePath) ->
     let mut physics = Physics::new(
         positions.clone(), // c_opos == c_pos -> particles start at rest
         vec![Vec2::ZERO; particles],
-        vec![Vec::new(); ((X_LEN + 1.0) * (Y_LEN + 1.0)) as usize],
-        Vec::with_capacity(particles),
         rx,
         2000.0,
     );

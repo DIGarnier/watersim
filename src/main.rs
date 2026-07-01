@@ -33,8 +33,6 @@ fn main() -> GameResult {
         let mut physics = Physics::new(
             Vec::with_capacity(15000),
             Vec::with_capacity(15000),
-            vec![Vec::new(); ((X_LEN + 1.0) * (Y_LEN + 1.0)) as usize],
-            Vec::with_capacity(15000),
             rx,
             2000.0,
         );

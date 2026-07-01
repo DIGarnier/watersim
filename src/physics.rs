@@ -216,9 +216,80 @@ impl NeighborList {
             last_pos: Vec2::ZERO,
         }
     }
+}
 
-    fn needs_rebuild(&self, current_pos: Vec2) -> bool {
-        (current_pos - self.last_pos).length() > VERLET_SKIN_DISTANCE * 0.5
+// Grid dimensions as integers (X_LEN/Y_LEN are f32 for legacy reasons)
+const GRID_W: usize = X_LEN as usize;
+const GRID_H: usize = Y_LEN as usize;
+const N_CELLS: usize = GRID_W * GRID_H;
+
+/// Uniform grid in CSR layout, built with a counting sort (Green 2010,
+/// Hoetzlein 2014). One flat index array + per-cell start offsets instead of
+/// a heap-allocated Vec per cell. Built once per step and reused across all
+/// constraint-solver iterations (particles move far less than a cell per
+/// step, so the one-cell stencil acts as a Verlet skin).
+struct CsrGrid {
+    cell_start: Vec<u32>, // N_CELLS + 1 offsets into `indices`
+    cursor: Vec<u32>,     // scratch: per-cell write cursor / counts
+    cell_of: Vec<u32>,    // per-particle cell id
+    indices: Vec<u32>,    // particle ids grouped by cell
+    occupied: Vec<u32>,   // ids of non-empty cells, ascending
+}
+
+impl CsrGrid {
+    fn new() -> Self {
+        Self {
+            cell_start: vec![0; N_CELLS + 1],
+            cursor: vec![0; N_CELLS],
+            cell_of: Vec::new(),
+            indices: Vec::new(),
+            occupied: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn cell_id(pos: Vec2) -> u32 {
+        // `as usize` saturates negatives to 0, matching the old clamping
+        let x = ((pos.x / GRID_SIZE) as usize).min(GRID_W - 1);
+        let y = ((pos.y / GRID_SIZE) as usize).min(GRID_H - 1);
+        (y * GRID_W + x) as u32
+    }
+
+    fn build(&mut self, positions: &[Vec2]) {
+        let n = positions.len();
+        self.cell_of.resize(n, 0);
+        self.indices.resize(n, 0);
+        self.cursor.fill(0);
+
+        for (i, p) in positions.iter().enumerate() {
+            let c = Self::cell_id(*p);
+            self.cell_of[i] = c;
+            self.cursor[c as usize] += 1;
+        }
+
+        let mut sum = 0u32;
+        self.occupied.clear();
+        for c in 0..N_CELLS {
+            let count = self.cursor[c];
+            self.cell_start[c] = sum;
+            self.cursor[c] = sum;
+            if count > 0 {
+                self.occupied.push(c as u32);
+            }
+            sum += count;
+        }
+        self.cell_start[N_CELLS] = sum;
+
+        for i in 0..n {
+            let c = self.cell_of[i] as usize;
+            self.indices[self.cursor[c] as usize] = i as u32;
+            self.cursor[c] += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn cell(&self, c: usize) -> &[u32] {
+        &self.indices[self.cell_start[c] as usize..self.cell_start[c + 1] as usize]
     }
 }
 
@@ -232,8 +303,7 @@ fn arbitrary_vector_field(mut pos: Vec2) -> Vec2 {
 pub struct Physics {
     c_opos: Vec<Vec2>,
     c_force: Vec<Vec2>,
-    table: Vec<Vec<usize>>,
-    others: Vec<usize>,
+    grid: CsrGrid,
     pub rx: Receiver<EventToPthread>,
     pub scale: f32,
 
@@ -253,16 +323,13 @@ impl Physics {
     pub fn new(
         c_opos: Vec<Vec2>,
         c_force: Vec<Vec2>,
-        table: Vec<Vec<usize>>,
-        others: Vec<usize>,
         rx: Receiver<EventToPthread>,
         scale: f32,
     ) -> Self {
         Self {
             c_opos,
             c_force,
-            table,
-            others,
+            grid: CsrGrid::new(),
             rx,
             scale,
             neighbor_lists: Vec::new(),
@@ -337,6 +404,10 @@ impl Physics {
     fn check_ball_collisions(&mut self, c_pos: &mut [Vec2]) {
         let _collision_start = Instant::now();
 
+        // Build the CSR grid once per step; forces and all solver iterations
+        // reuse it (positions move a small fraction of a cell per step).
+        self.grid.build(c_pos);
+
         // Use Barnes-Hut for force calculation if enabled
         if self.use_barnes_hut {
             self.compute_forces_barnes_hut(c_pos);
@@ -392,34 +463,31 @@ impl Physics {
         // Resize neighbor lists if needed
         self.neighbor_lists.resize_with(c_pos.len(), NeighborList::new);
 
-        // Build spatial hash for neighbor finding
-        for i in 0..(X_LEN * Y_LEN) as usize {
-            self.table[i].clear();
-        }
-
-        for (i, pos_a) in c_pos.iter().enumerate() {
-            let y = (pos_a.y / GRID_SIZE).min(Y_LEN - 1.0) as usize;
-            let x = (pos_a.x / GRID_SIZE).min(X_LEN - 1.0) as usize;
-            self.table[y * X_LEN as usize + x].push(i);
-        }
-
-        // Build neighbor lists
-        let interaction_range = BALL_SIZE * 2.0 + VERLET_SKIN_DISTANCE;
+        // The step-level CSR grid is already built; gather from it.
+        let interaction_range_sq =
+            (BALL_SIZE * 2.0 + VERLET_SKIN_DISTANCE) * (BALL_SIZE * 2.0 + VERLET_SKIN_DISTANCE);
         for i in 0..c_pos.len() {
             self.neighbor_lists[i].neighbors.clear();
             self.neighbor_lists[i].last_pos = c_pos[i];
 
-            let y = (c_pos[i].y / GRID_SIZE).min(Y_LEN - 1.0) as usize;
-            let x = (c_pos[i].x / GRID_SIZE).min(X_LEN - 1.0) as usize;
+            let cell = self.grid.cell_of[i] as usize;
+            let (x, y) = (cell % GRID_W, cell / GRID_W);
 
-            // Check neighboring cells
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    let ny = (y as i32 + dy).clamp(0, (Y_LEN - 1.0) as i32) as usize;
-                    let nx = (x as i32 + dx).clamp(0, (X_LEN - 1.0) as i32) as usize;
-
-                    for &j in &self.table[ny * X_LEN as usize + nx] {
-                        if i != j && (c_pos[i] - c_pos[j]).length() < interaction_range {
+            for dy in -1i32..=1 {
+                let ny = y as i32 + dy;
+                if ny < 0 || ny >= GRID_H as i32 {
+                    continue;
+                }
+                for dx in -1i32..=1 {
+                    let nx = x as i32 + dx;
+                    if nx < 0 || nx >= GRID_W as i32 {
+                        continue;
+                    }
+                    for &j in self.grid.cell(ny as usize * GRID_W + nx as usize) {
+                        let j = j as usize;
+                        if i != j
+                            && (c_pos[i] - c_pos[j]).length_squared() < interaction_range_sq
+                        {
                             self.neighbor_lists[i].neighbors.push(j);
                         }
                     }
@@ -441,111 +509,82 @@ impl Physics {
     }
 
     fn compute_forces_with_spatial_hash(&mut self, c_pos: &[Vec2]) {
-        // Original spatial hash approach
-        for i in 0..(X_LEN * Y_LEN) as usize {
-            self.table[i].clear();
-        }
+        // Half-neighborhood sweep over occupied CSR cells: each unordered cell
+        // pair is visited once and Newton's third law is applied per pair.
+        for oc in 0..self.grid.occupied.len() {
+            let cell = self.grid.occupied[oc] as usize;
+            let (x, y) = (cell % GRID_W, cell / GRID_W);
+            let currents = self.grid.cell(cell);
 
-        for (i, pos_a) in c_pos.iter().enumerate() {
-            let y = (pos_a.y / GRID_SIZE).min(Y_LEN - 1.0) as usize;
-            let x = (pos_a.x / GRID_SIZE).min(X_LEN - 1.0) as usize;
-            self.table[y * X_LEN as usize + x].push(i);
-        }
-
-        for y in 0..(Y_LEN) as usize {
-            for x in 0..(X_LEN) as usize {
-                self.others.clear();
-                let currents = &self.table[y * X_LEN as usize + x];
-
-                for dy in [-1, 0, 1] {
-                    for dx in [-1, 0, 1] {
-                        if dx == 0 && dy == 0 {
-                            continue;
-                        }
-                        let ny = (y as i32 + dy).clamp(0, Y_LEN as i32) as usize;
-                        let nx = (x as i32 + dx).clamp(0, X_LEN as i32) as usize;
-                        self.others.extend(&self.table[ny * X_LEN as usize + nx]);
-                    }
+            // Pairs within the cell
+            for a in 0..currents.len() {
+                let i = currents[a] as usize;
+                for b in a + 1..currents.len() {
+                    let j = currents[b] as usize;
+                    let f = force(c_pos[i], c_pos[j], self.scale) / 8.0;
+                    self.c_force[i] += f;
+                    self.c_force[j] -= f;
                 }
+            }
 
-                for i in 0..currents.len() {
-                    let pos_a = c_pos[currents[i]];
-                    for j in i + 1..currents.len() {
-                        let pos_b = c_pos[currents[j]];
-                        self.c_force[currents[i]] += force(pos_a, pos_b, self.scale) / 8.0;
-                    }
-
-                    for j in 0..self.others.len() {
-                        let pos_b = c_pos[self.others[j]];
-                        if pos_a != pos_b {
-                            self.c_force[currents[i]] += force(pos_a, pos_b, self.scale) / 8.0;
-                        }
+            // Forward half-stencil: E, SW, S, SE
+            for (dx, dy) in [(1i32, 0i32), (-1, 1), (0, 1), (1, 1)] {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx < 0 || nx >= GRID_W as i32 || ny >= GRID_H as i32 {
+                    continue;
+                }
+                for &i in currents {
+                    let i = i as usize;
+                    for &j in self.grid.cell(ny as usize * GRID_W + nx as usize) {
+                        let j = j as usize;
+                        let f = force(c_pos[i], c_pos[j], self.scale) / 8.0;
+                        self.c_force[i] += f;
+                        self.c_force[j] -= f;
                     }
                 }
             }
         }
     }
 
+    #[inline(always)]
+    fn project_pair(c_pos: &mut [Vec2], i: usize, j: usize) {
+        let pos_a = c_pos[i];
+        let pos_b = c_pos[j];
+        if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
+            let mut col_axis = pos_a - pos_b;
+            let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
+            col_axis = col_axis.try_normalize().unwrap_or(Vec2::ZERO);
+            c_pos[i] -= col_axis * mvt / 2.0;
+            c_pos[j] += col_axis * mvt / 2.0;
+        }
+    }
+
     fn resolve_collisions(&mut self, c_pos: &mut [Vec2]) {
-        // Rebuild spatial hash for collision detection
-        for i in 0..(X_LEN * Y_LEN) as usize {
-            self.table[i].clear();
-        }
+        // Sweep only occupied cells of the step-level CSR grid, visiting each
+        // unordered cell pair once via the forward half-stencil. Reusing the
+        // grid across solver iterations is safe: a particle moves far less
+        // than one 10 px cell within a single 1/480 s step, so the one-cell
+        // stencil still finds every potentially overlapping pair.
+        for oc in 0..self.grid.occupied.len() {
+            let cell = self.grid.occupied[oc] as usize;
+            let (x, y) = (cell % GRID_W, cell / GRID_W);
+            let currents = self.grid.cell(cell);
 
-        for (i, pos_a) in c_pos.iter().enumerate() {
-            let y = (pos_a.y / GRID_SIZE).min(Y_LEN - 1.0) as usize;
-            let x = (pos_a.x / GRID_SIZE).min(X_LEN - 1.0) as usize;
-            self.table[y * X_LEN as usize + x].push(i);
-        }
-
-        for y in 0..(Y_LEN) as usize {
-            for x in 0..(X_LEN) as usize {
-                self.others.clear();
-                let currents = &self.table[y * X_LEN as usize + x];
-
-                for dy in [-1, 0, 1] {
-                    for dx in [-1, 0, 1] {
-                        if dx == 0 && dy == 0 {
-                            continue;
-                        }
-                        let ny = (y as i32 + dy).clamp(0, Y_LEN as i32) as usize;
-                        let nx = (x as i32 + dx).clamp(0, X_LEN as i32) as usize;
-                        self.others.extend(&self.table[ny * X_LEN as usize + nx]);
-                    }
+            for a in 0..currents.len() {
+                let i = currents[a] as usize;
+                for b in a + 1..currents.len() {
+                    Self::project_pair(c_pos, i, currents[b] as usize);
                 }
+            }
 
-                for i in 0..currents.len() {
-                    let pos_a = c_pos[currents[i]];
-                    for j in i + 1..currents.len() {
-                        let pos_b = c_pos[currents[j]];
-
-                        if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
-                            let mut col_axis = pos_a - pos_b;
-                            let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
-                            col_axis = col_axis
-                                .try_normalize()
-                                .unwrap_or_else(|| Vec2::new(0., 0.));
-                            c_pos[currents[i]] -= col_axis * mvt / 2.0;
-                            c_pos[currents[j]] += col_axis * mvt / 2.0;
-                        }
-                    }
-
-                    for j in 0..self.others.len() {
-                        let pos_b = c_pos[self.others[j]];
-
-                        if pos_a == pos_b {
-                            continue;
-                        }
-
-                        if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
-                            let mut col_axis = pos_a - pos_b;
-                            let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
-                            col_axis = col_axis
-                                .try_normalize()
-                                .unwrap_or_else(|| Vec2::new(0., 0.));
-                            c_pos[currents[i]] -= col_axis * mvt / 2.0;
-                            c_pos[self.others[j]] += col_axis * mvt / 2.0;
-                        }
+            for (dx, dy) in [(1i32, 0i32), (-1, 1), (0, 1), (1, 1)] {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx < 0 || nx >= GRID_W as i32 || ny >= GRID_H as i32 {
+                    continue;
+                }
+                for &i in currents {
+                    for &j in self.grid.cell(ny as usize * GRID_W + nx as usize) {
+                        Self::project_pair(c_pos, i as usize, j as usize);
                     }
                 }
             }
@@ -553,27 +592,23 @@ impl Physics {
     }
 
     fn check_wall_collisions(&mut self, c_pos: &mut [Vec2]) {
-        for y in 0..(Y_LEN) as usize {
-            for &i in self.table[y * X_LEN as usize].iter() {
-                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
+        // Left and right border columns
+        for y in 0..GRID_H {
+            for &i in self.grid.cell(y * GRID_W) {
+                resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
+            }
+            for &i in self.grid.cell(y * GRID_W + (GRID_W - 1)) {
+                resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
             }
         }
 
-        for y in 0..(Y_LEN) as usize {
-            for &i in self.table[y * X_LEN as usize + (X_LEN - 1.0) as usize].iter() {
-                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
+        // Bottom and top border rows
+        for x in 0..GRID_W {
+            for &i in self.grid.cell(x) {
+                resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
             }
-        }
-
-        for x in 0..(X_LEN) as usize {
-            for &i in self.table[x].iter() {
-                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
-            }
-        }
-
-        for x in 0..(X_LEN) as usize {
-            for &i in self.table[((Y_LEN - 1.0) * X_LEN) as usize + x].iter() {
-                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
+            for &i in self.grid.cell((GRID_H - 1) * GRID_W + x) {
+                resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
             }
         }
     }
