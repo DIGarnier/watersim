@@ -1,7 +1,7 @@
 // SIMD-optimized physics calculations
 // Using SoA (Structure of Arrays) layout for better vectorization
 
-use ggez::glam::Vec2;
+use glam::Vec2;
 
 // SoA layout for particle data - better for SIMD
 pub struct ParticleSoA {

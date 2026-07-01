@@ -1,6 +1,4 @@
-pub mod constants;
-pub mod physics;
-pub mod simd_physics;
+use lolballs::{constants, physics};
 
 use std::path;
 use std::sync::mpsc::{channel, Sender};

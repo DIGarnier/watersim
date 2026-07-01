@@ -1,4 +1,4 @@
-use ggez::glam::Vec2;
+use glam::Vec2;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
