@@ -115,54 +115,63 @@ impl AABB {
 
 const BH_NONE: u32 = u32::MAX;
 
-// Barnes-Hut quadtree node stored in a flat arena. `children` is the index of
-// the first of 4 contiguous children, or BH_NONE for a leaf.
 // Max particles per leaf before it subdivides. Bucketed leaves keep the tree
 // shallow and turn near-field work into tight exact loops (standard treecode
 // practice; see docs/literature.md §3).
 const BH_LEAF_CAP: u32 = 8;
 
+/// Traversal-hot node data: 24 bytes, so ~2.7 nodes per cache line versus 44
+/// bytes when bounds/count rode along. Force traversal touches only this.
 #[derive(Clone, Copy)]
-struct BhNode {
-    bounds: AABB,
+struct BhHot {
     center_of_mass: Vec2,
     total_mass: f32,
-    size_sq: f32, // bounds.size()² cached for the sqrt-free acceptance test
+    size_sq: f32,  // bounds.size()² cached for the sqrt-free acceptance test
     children: u32, // BH_NONE = leaf, else index of first of 4 contiguous children
     first: u32,    // head of this leaf's particle list (BH_NONE when empty)
-    count: u32,    // particles in this leaf
 }
 
 /// Arena-backed Barnes-Hut quadtree (Burtscher & Pingali 2011 style: contiguous
-/// node storage, no per-node allocation, non-recursive traversal). The arena,
-/// per-particle lists and traversal stack keep their capacity across frames,
-/// so steady-state tree builds are allocation-free.
+/// node storage, no per-node allocation, non-recursive traversal). Node data is
+/// split hot/cold: `hot` is everything the force traversal reads; `bounds` and
+/// `count` exist only for tree construction. All buffers keep their capacity
+/// across frames, so steady-state tree builds are allocation-free.
 struct BhTree {
-    nodes: Vec<BhNode>,
-    next: Vec<u32>,  // per-particle intrusive list linking leaf members
-    ppos: Vec<Vec2>, // per-particle (clamped) position as inserted
+    hot: Vec<BhHot>,
+    bounds: Vec<AABB>, // build-only
+    count: Vec<u32>,   // build-only: particles in each leaf
+    next: Vec<u32>,    // per-particle intrusive list linking leaf members
+    ppos: Vec<Vec2>,   // per-particle (clamped) position as inserted
 }
 
 impl BhTree {
     fn new() -> Self {
         Self {
-            nodes: Vec::new(),
+            hot: Vec::new(),
+            bounds: Vec::new(),
+            count: Vec::new(),
             next: Vec::new(),
             ppos: Vec::new(),
         }
     }
 
-    fn clear(&mut self, bounds: AABB, n_particles: usize) {
-        self.nodes.clear();
-        self.nodes.push(BhNode {
-            bounds,
+    fn push_node(&mut self, bounds: AABB) {
+        self.hot.push(BhHot {
             center_of_mass: Vec2::ZERO,
             total_mass: 0.0,
             size_sq: bounds.size() * bounds.size(),
             children: BH_NONE,
             first: BH_NONE,
-            count: 0,
         });
+        self.bounds.push(bounds);
+        self.count.push(0);
+    }
+
+    fn clear(&mut self, bounds: AABB, n_particles: usize) {
+        self.hot.clear();
+        self.bounds.clear();
+        self.count.clear();
+        self.push_node(bounds);
         self.next.resize(n_particles, BH_NONE);
         self.ppos.resize(n_particles, Vec2::ZERO);
     }
@@ -173,6 +182,13 @@ impl BhTree {
         ((pos.y >= c.y) as usize) * 2 + ((pos.x >= c.x) as usize)
     }
 
+    #[inline(always)]
+    fn fold_into(hot: &mut BhHot, pos: Vec2, mass: f32) {
+        let total = hot.total_mass + mass;
+        hot.center_of_mass = (hot.center_of_mass * hot.total_mass + pos * mass) / total;
+        hot.total_mass = total;
+    }
+
     fn insert(&mut self, idx: u32, pos: Vec2, mass: f32) {
         // Below this cell size, keep piling particles into the leaf instead of
         // subdividing forever (guards against (near-)coincident particles).
@@ -181,69 +197,49 @@ impl BhTree {
         self.ppos[idx as usize] = pos;
         let mut node = 0usize;
         loop {
-            let n = self.nodes[node];
+            let n = self.hot[node];
 
             if n.children != BH_NONE {
                 // Internal node: fold the new mass into the aggregate, descend.
-                let total = n.total_mass + mass;
-                self.nodes[node].center_of_mass =
-                    (n.center_of_mass * n.total_mass + pos * mass) / total;
-                self.nodes[node].total_mass = total;
-                node = n.children as usize + Self::quadrant_index(&n.bounds, pos);
+                Self::fold_into(&mut self.hot[node], pos, mass);
+                node = n.children as usize + Self::quadrant_index(&self.bounds[node], pos);
                 continue;
             }
 
-            if n.count < BH_LEAF_CAP || n.bounds.size() < MIN_CELL {
+            if self.count[node] < BH_LEAF_CAP || self.bounds[node].size() < MIN_CELL {
                 // Leaf with room: link the particle in and update the aggregate.
                 self.next[idx as usize] = n.first;
-                let total = n.total_mass + mass;
-                let nn = &mut self.nodes[node];
-                nn.first = idx;
-                nn.count = n.count + 1;
-                nn.center_of_mass = (n.center_of_mass * n.total_mass + pos * mass) / total;
-                nn.total_mass = total;
+                self.hot[node].first = idx;
+                self.count[node] += 1;
+                Self::fold_into(&mut self.hot[node], pos, mass);
                 return;
             }
 
             // Full leaf: subdivide and redistribute the residents, then retry
             // this node (now internal) with the incoming particle.
-            let first_child = self.nodes.len() as u32;
+            let node_bounds = self.bounds[node];
+            let first_child = self.hot.len() as u32;
             for q in 0..4 {
-                let qb = n.bounds.quadrant(q);
-                self.nodes.push(BhNode {
-                    bounds: qb,
-                    center_of_mass: Vec2::ZERO,
-                    total_mass: 0.0,
-                    size_sq: qb.size() * qb.size(),
-                    children: BH_NONE,
-                    first: BH_NONE,
-                    count: 0,
-                });
+                self.push_node(node_bounds.quadrant(q));
             }
 
             let mut p = n.first;
-            let per_particle_mass = n.total_mass / n.count as f32;
+            let per_particle_mass = n.total_mass / self.count[node] as f32;
             while p != BH_NONE {
                 let p_next = self.next[p as usize];
                 let p_pos = self.ppos[p as usize];
-                let child =
-                    first_child as usize + Self::quadrant_index(&n.bounds, p_pos);
-                let c = self.nodes[child];
-                self.next[p as usize] = c.first;
-                let total = c.total_mass + per_particle_mass;
-                let cn = &mut self.nodes[child];
-                cn.first = p;
-                cn.count = c.count + 1;
-                cn.center_of_mass =
-                    (c.center_of_mass * c.total_mass + p_pos * per_particle_mass) / total;
-                cn.total_mass = total;
+                let child = first_child as usize + Self::quadrant_index(&node_bounds, p_pos);
+                self.next[p as usize] = self.hot[child].first;
+                self.hot[child].first = p;
+                self.count[child] += 1;
+                Self::fold_into(&mut self.hot[child], p_pos, per_particle_mass);
                 p = p_next;
             }
 
-            let nn = &mut self.nodes[node];
+            let nn = &mut self.hot[node];
             nn.children = first_child;
             nn.first = BH_NONE;
-            nn.count = 0;
+            self.count[node] = 0;
         }
     }
 
@@ -256,7 +252,7 @@ impl BhTree {
         stack.push(0);
 
         while let Some(idx) = stack.pop() {
-            let n = &self.nodes[idx as usize];
+            let n = &self.hot[idx as usize];
             if n.total_mass == 0.0 {
                 continue;
             }
@@ -274,6 +270,15 @@ impl BhTree {
                 force += diff * (scale * n.total_mass * fast_rsqrt(dist_sq) / dist_sq.max(1.0));
             } else if n.children != BH_NONE {
                 let c = n.children;
+                // The 4 children (96 B, contiguous) will be popped within the
+                // next few iterations; start their cache lines now.
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                    let p = self.hot.as_ptr().add(c as usize) as *const i8;
+                    _mm_prefetch(p, _MM_HINT_T0);
+                    _mm_prefetch(p.add(64), _MM_HINT_T0);
+                }
                 stack.extend_from_slice(&[c, c + 1, c + 2, c + 3]);
             } else {
                 // Near leaf: exact particle-particle interactions.
