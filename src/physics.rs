@@ -35,14 +35,13 @@ const BARNES_HUT_THETA: f32 = 0.5; // Barnes-Hut approximation parameter
 // docs/benchmarks/04-small-steps.md for the measured speed/quality trade).
 const SOLVER_ITERATIONS: usize = 4;
 
-// Below this particle count the serial grid paths win. Measured on a 4-core
-// Xeon: parallel force gather + colored solver are a ~2x win at 24k particles,
-// within noise at 12k, and a regression at 3-6k (the solver alone spawns
-// 6 colors x 4 iterations = 24 parallel regions per step, whose overhead
-// dominates small workloads). The Barnes-Hut traversal has no threshold: it
-// is one region of heavy independent work and wins at every tested size.
+// Below this particle count the serial grid paths win (rayon region overhead
+// dominates small workloads). Re-tuned for the packed Jacobi engine, which
+// runs only 5 parallel regions per step (1 force pass + 4 solver iterations);
+// see docs/benchmarks/10-packed-simd-jacobi.md for the sweep. The Barnes-Hut
+// traversal has no threshold: it is one region of heavy independent work and
+// wins at every tested size.
 const PAR_MIN_PARTICLES: usize = 16_000;
-const PAR_SOLVER_MIN_PARTICLES: usize = 16_000;
 
 const LEFT_WALL: f32 = 0.;
 const RIGHT_WALL: f32 = WIDTH;
@@ -350,11 +349,6 @@ struct CsrGrid {
     cell_of: Vec<u32>,    // per-particle cell id
     indices: Vec<u32>,    // particle ids grouped by cell
     occupied: Vec<u32>,   // ids of non-empty cells, ascending
-    // Occupied cells split into 6 color classes for the parallel solver.
-    // Colors are (x mod 3) + 3·(y mod 2): with the forward half-stencil
-    // {E, SW, S, SE}, a cell's write region spans x±1 and y..y+1, so two
-    // same-color cells (Δx ≥ 3 or Δy ≥ 2) always touch disjoint particles.
-    color_buckets: [Vec<u32>; 6],
 }
 
 impl CsrGrid {
@@ -365,7 +359,6 @@ impl CsrGrid {
             cell_of: Vec::new(),
             indices: Vec::new(),
             occupied: Vec::new(),
-            color_buckets: Default::default(),
         }
     }
 
@@ -392,17 +385,12 @@ impl CsrGrid {
 
         let mut sum = 0u32;
         self.occupied.clear();
-        for bucket in &mut self.color_buckets {
-            bucket.clear();
-        }
         for c in 0..N_CELLS {
             let count = self.cursor[c];
             self.cell_start[c] = sum;
             self.cursor[c] = sum;
             if count > 0 {
                 self.occupied.push(c as u32);
-                let (x, y) = (c % GRID_W, c / GRID_W);
-                self.color_buckets[(x % 3) + 3 * (y % 2)].push(c as u32);
             }
             sum += count;
         }
@@ -438,21 +426,99 @@ fn fast_rsqrt(x: f32) -> f32 {
     }
 }
 
-/// Raw pointer that rayon closures may capture. Every use is guarded by a
-/// partitioning argument (cell coloring / per-cell ownership) documented at
-/// the use site.
-#[derive(Clone, Copy)]
-struct SendPtr<T>(*mut T);
-unsafe impl<T> Send for SendPtr<T> {}
-unsafe impl<T> Sync for SendPtr<T> {}
-
-impl<T> SendPtr<T> {
-    // Accessor (rather than field access) so closures capture the whole
-    // wrapper, not the raw pointer, which would defeat the Send/Sync impls.
-    #[inline(always)]
-    fn get(self) -> *mut T {
-        self.0
+/// The 3 contiguous packed ranges covering a cell's 3×3 neighborhood: cells
+/// x−1..=x+1 of one row are adjacent in row-major order, so their CSR ranges
+/// concatenate (empty cells contribute empty subranges for free). This is what
+/// makes the packed kernels below stream memory sequentially and vectorize.
+#[inline(always)]
+fn stencil_rows(cell_start: &[u32], cell: usize) -> [(usize, usize); 3] {
+    let (x, y) = (cell % GRID_W, cell / GRID_W);
+    let x0 = x.saturating_sub(1);
+    let x1 = (x + 1).min(GRID_W - 1);
+    let mut rows = [(0usize, 0usize); 3];
+    for dy in 0..3usize {
+        let yy = y as i32 + dy as i32 - 1;
+        if yy >= 0 && yy < GRID_H as i32 {
+            let base = yy as usize * GRID_W;
+            rows[dy] = (
+                cell_start[base + x0] as usize,
+                cell_start[base + x1 + 1] as usize,
+            );
+        }
     }
+    rows
+}
+
+/// Repulsion force gather over packed row slices, branchless so LLVM can
+/// vectorize the inner loop. `s8` = scale/8 (the historical accumulation
+/// factor). Self-interaction masks out via d² < BALL_SIZE² like any touching
+/// pair; the clamped denominator keeps masked lanes finite (never NaN·0).
+#[inline(always)]
+fn gather_force(
+    xa: f32,
+    ya: f32,
+    px: &[f32],
+    py: &[f32],
+    rows: &[(usize, usize); 3],
+    s8: f32,
+) -> (f32, f32) {
+    const BALL_SQ: f32 = BALL_SIZE * BALL_SIZE;
+    let mut fx = 0.0f32;
+    let mut fy = 0.0f32;
+    for &(start, end) in rows {
+        for k in start..end {
+            let dx = xa - px[k];
+            let dy = ya - py[k];
+            let d2 = dx * dx + dy * dy;
+            let m = if d2 >= BALL_SQ { 1.0f32 } else { 0.0 };
+            // active pairs have d2 ≥ BALL² > 1, so max(d2,1) == d2 here
+            let d2c = d2.max(BALL_SQ);
+            let w = (s8 * m) / (d2c.sqrt() * d2c);
+            fx += dx * w;
+            fy += dy * w;
+        }
+    }
+    (fx, fy)
+}
+
+/// One Jacobi half-correction gather for the contact solver: the particle
+/// accumulates its half of every overlapping pair's separation; the partner
+/// accumulates the other half in its own gather. Same per-iteration pair
+/// correction as the old Gauss-Seidel sweep, but order-independent, so it
+/// vectorizes and parallelizes with no cell coloring.
+#[inline(always)]
+fn gather_correction(
+    xa: f32,
+    ya: f32,
+    px: &[f32],
+    py: &[f32],
+    rows: &[(usize, usize); 3],
+) -> (f32, f32) {
+    const CONTACT: f32 = BALL_SIZE + BALL_SIZE;
+    let mut cx = 0.0f32;
+    let mut cy = 0.0f32;
+    for &(start, end) in rows {
+        for k in start..end {
+            let dx = xa - px[k];
+            let dy = ya - py[k];
+            let d2 = dx * dx + dy * dy;
+            // Excludes self (d2 == 0) and coincident pairs, like the old
+            // try_normalize() -> ZERO path.
+            let m = if d2 < CONTACT * CONTACT && d2 > 1e-12 {
+                1.0f32
+            } else {
+                0.0
+            };
+            let d2c = d2.max(1e-12);
+            let inv = 1.0 / d2c.sqrt();
+            let dist = d2c * inv;
+            // == normalized(axis) * 0.75 * (dist - CONTACT) / 2, masked
+            let term = m * 0.375 * (dist - CONTACT) * inv;
+            cx -= dx * term;
+            cy -= dy * term;
+        }
+    }
+    (cx, cy)
 }
 
 pub struct Physics {
@@ -468,6 +534,13 @@ pub struct Physics {
     stale_steps: usize,
     scratch_v2: Vec<Vec2>,
     scratch_f: Vec<f32>,
+    // Packed SoA state in CSR (cell) order, rebuilt each step: positions for
+    // the force/solver kernels plus a shared accumulator pair.
+    px: Vec<f32>,
+    py: Vec<f32>,
+    acc_x: Vec<f32>,
+    acc_y: Vec<f32>,
+    packed_cell: Vec<u32>,
     frame_count: usize,
     use_barnes_hut: bool,
     use_verlet_lists: bool,
@@ -496,6 +569,11 @@ impl Physics {
             stale_steps: 0,
             scratch_v2: Vec::new(),
             scratch_f: Vec::new(),
+            px: Vec::new(),
+            py: Vec::new(),
+            acc_x: Vec::new(),
+            acc_y: Vec::new(),
+            packed_cell: Vec::new(),
             frame_count: 0,
             use_barnes_hut: true,  // Enable Barnes-Hut by default
             use_verlet_lists: true, // Enable Verlet lists by default
@@ -517,13 +595,18 @@ impl Physics {
 
         // Build the CSR grid once per step; forces and all solver iterations
         // reuse it (positions move a small fraction of a cell per step).
+        let t = Instant::now();
         self.grid.build(&share.c_pos);
+        share.perf_stats.neighbor_rebuild_time_us = t.elapsed().as_micros() as u64;
 
         if self.frame_count % REORDER_INTERVAL == 0 {
             self.reorder_particles(share);
         }
 
-        self.check_ball_collisions(&mut share.c_pos);
+        let ShareData {
+            c_pos, perf_stats, ..
+        } = share;
+        self.check_ball_collisions(c_pos, perf_stats);
 
         self.frame_count += 1;
 
@@ -624,25 +707,67 @@ impl Physics {
         self.stale_steps = VERLET_REBUILD_RETRY - 1;
     }
 
-    fn check_ball_collisions(&mut self, c_pos: &mut [Vec2]) {
-        let _collision_start = Instant::now();
+    fn check_ball_collisions(&mut self, c_pos: &mut [Vec2], stats: &mut PerformanceStats) {
+        // Two solver engines (see docs/benchmarks/10-packed-simd-jacobi.md):
+        // below the parallel threshold, the scalar Gauss-Seidel half-stencil
+        // sweep on c_pos wins (cells hold ~1-2 particles, so packed rows are
+        // too short for SIMD, and the Jacobi gather does every pair twice).
+        // At scale, the packed Jacobi engine wins: positions packed once into
+        // CSR-ordered SoA, gathers are order-independent, and a step needs
+        // only 5 parallel regions instead of 24 colored ones.
+        let packed = c_pos.len() >= PAR_MIN_PARTICLES;
+        if packed {
+            self.pack_positions(c_pos);
+        }
 
         // Use Barnes-Hut for force calculation if enabled
+        let t = Instant::now();
         if self.use_barnes_hut {
-            self.compute_forces_barnes_hut(c_pos);
+            self.compute_forces_barnes_hut(c_pos, stats);
         } else {
             self.compute_forces_naive(c_pos);
         }
+        stats.force_calc_time_us = t.elapsed().as_micros() as u64;
 
         // Handle collisions using constraint solver
-        for _ in 0..SOLVER_ITERATIONS {
-            self.resolve_collisions(c_pos);
-            self.check_wall_collisions(c_pos);
+        let t = Instant::now();
+        if packed {
+            for _ in 0..SOLVER_ITERATIONS {
+                self.resolve_collisions_packed();
+                self.check_wall_collisions_packed();
+            }
+            self.scatter_positions(c_pos);
+        } else {
+            for _ in 0..SOLVER_ITERATIONS {
+                self.resolve_collisions_serial(c_pos);
+                self.check_wall_collisions_serial(c_pos);
+            }
+        }
+        stats.collision_time_us = t.elapsed().as_micros() as u64;
+    }
+
+    fn pack_positions(&mut self, c_pos: &[Vec2]) {
+        let grid = &self.grid;
+        self.px.clear();
+        self.py.clear();
+        self.packed_cell.clear();
+        self.px
+            .extend(grid.indices.iter().map(|&i| c_pos[i as usize].x));
+        self.py
+            .extend(grid.indices.iter().map(|&i| c_pos[i as usize].y));
+        self.packed_cell
+            .extend(grid.indices.iter().map(|&i| grid.cell_of[i as usize]));
+    }
+
+    fn scatter_positions(&self, c_pos: &mut [Vec2]) {
+        for (k, &i) in self.grid.indices.iter().enumerate() {
+            c_pos[i as usize] = Vec2::new(self.px[k], self.py[k]);
         }
     }
 
-    fn compute_forces_barnes_hut(&mut self, c_pos: &[Vec2]) {
+    fn compute_forces_barnes_hut(&mut self, c_pos: &[Vec2], stats: &mut PerformanceStats) {
         // Rebuild the arena tree (capacity persists across frames)
+        let t = Instant::now();
         let bounds = AABB::new(
             Vec2::new(LEFT_WALL, BOTTOM_WALL),
             Vec2::new(RIGHT_WALL, TOP_WALL),
@@ -655,6 +780,8 @@ impl Physics {
             self.bh_tree
                 .insert(i as u32, pos.clamp(bounds.min, bounds.max), 1.0);
         }
+        stats.tree_build_time_us = t.elapsed().as_micros() as u64;
+        stats.tree_node_count = self.bh_tree.hot.len();
 
         // Independent read-only traversals: parallelize over particles with a
         // per-thread scratch stack.
@@ -760,41 +887,33 @@ impl Physics {
     }
 
     fn compute_forces_with_spatial_hash(&mut self, c_pos: &[Vec2]) {
-        if c_pos.len() >= PAR_MIN_PARTICLES {
-            // Parallel over occupied cells: each cell gathers forces for its
-            // own particles from the full 3×3 neighborhood, so force writes
-            // are disjoint across cells.
-            let (grid, scale) = (&self.grid, self.scale);
-            let c_force = SendPtr(self.c_force.as_mut_ptr());
-            grid.occupied.par_iter().for_each(|&cell| {
-                let cell = cell as usize;
-                let (x, y) = (cell % GRID_W, cell / GRID_W);
-                for &i in grid.cell(cell) {
-                    let i = i as usize;
-                    let mut acc = Vec2::ZERO;
-                    for dy in -1i32..=1 {
-                        let ny = y as i32 + dy;
-                        if ny < 0 || ny >= GRID_H as i32 {
-                            continue;
-                        }
-                        for dx in -1i32..=1 {
-                            let nx = x as i32 + dx;
-                            if nx < 0 || nx >= GRID_W as i32 {
-                                continue;
-                            }
-                            for &j in grid.cell(ny as usize * GRID_W + nx as usize) {
-                                let j = j as usize;
-                                if i != j {
-                                    acc += force(c_pos[i], c_pos[j], scale);
-                                }
-                            }
-                        }
-                    }
-                    // Safety: cell membership partitions particles, so no other
-                    // thread writes c_force[i].
-                    unsafe { *c_force.get().add(i) += acc / 8.0 };
-                }
-            });
+        let n = c_pos.len();
+        if n >= PAR_MIN_PARTICLES {
+            // Packed parallel gather over the CSR-ordered SoA arrays.
+            let s8 = self.scale / 8.0;
+            self.acc_x.clear();
+            self.acc_x.resize(n, 0.0);
+            self.acc_y.clear();
+            self.acc_y.resize(n, 0.0);
+
+            {
+                let (grid, px, py, cells) = (&self.grid, &self.px, &self.py, &self.packed_cell);
+                let (acc_x, acc_y) = (&mut self.acc_x, &mut self.acc_y);
+                acc_x
+                    .par_iter_mut()
+                    .zip(acc_y.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(k, (fx, fy))| {
+                        let rows = stencil_rows(&grid.cell_start, cells[k] as usize);
+                        let (gx, gy) = gather_force(px[k], py[k], px, py, &rows, s8);
+                        *fx = gx;
+                        *fy = gy;
+                    });
+            }
+
+            for (k, &i) in self.grid.indices.iter().enumerate() {
+                self.c_force[i as usize] += Vec2::new(self.acc_x[k], self.acc_y[k]);
+            }
             return;
         }
 
@@ -836,10 +955,8 @@ impl Physics {
     }
 
     /// Half the positional correction for an overlapping pair, or None for
-    /// the common non-overlapping case — callers must skip the position
-    /// stores entirely then (most checked pairs don't collide, and the write
-    /// traffic of applying a ZERO correction measurably costs). One rsqrt
-    /// replaces the old length() + try_normalize() (two sqrts).
+    /// the common non-overlapping case — callers skip the position stores
+    /// entirely then. One rsqrt replaces length() + try_normalize().
     #[inline(always)]
     fn pair_correction(pos_a: Vec2, pos_b: Vec2) -> Option<Vec2> {
         const CONTACT: f32 = BALL_SIZE + BALL_SIZE;
@@ -855,16 +972,6 @@ impl Physics {
         Some(col_axis * (inv_dist * 0.375 * (dist - CONTACT)))
     }
 
-    /// Safety: caller must guarantee no other thread concurrently accesses
-    /// positions i, j (ensured by the 6-coloring of cells).
-    #[inline(always)]
-    unsafe fn project_pair_raw(p: *mut Vec2, i: usize, j: usize) {
-        if let Some(corr) = Self::pair_correction(*p.add(i), *p.add(j)) {
-            *p.add(i) -= corr;
-            *p.add(j) += corr;
-        }
-    }
-
     #[inline(always)]
     fn project_pair(c_pos: &mut [Vec2], i: usize, j: usize) {
         if let Some(corr) = Self::pair_correction(c_pos[i], c_pos[j]) {
@@ -873,49 +980,9 @@ impl Physics {
         }
     }
 
-    fn resolve_collisions(&mut self, c_pos: &mut [Vec2]) {
-        if c_pos.len() >= PAR_SOLVER_MIN_PARTICLES {
-            // Parallel constraint projection via cell coloring: the 6 color
-            // classes are processed sequentially, cells within a class in
-            // parallel — same-color cells touch disjoint particles (see
-            // CsrGrid::color_buckets), so the raw-pointer writes never race.
-            let grid = &self.grid;
-            let pos_ptr = SendPtr(c_pos.as_mut_ptr());
-            for bucket in &grid.color_buckets {
-                bucket.par_iter().for_each(|&cell| {
-                    let cell = cell as usize;
-                    let (x, y) = (cell % GRID_W, cell / GRID_W);
-                    let currents = grid.cell(cell);
-                    let p = pos_ptr.get();
-                    unsafe {
-                        for a in 0..currents.len() {
-                            let i = currents[a] as usize;
-                            for b in a + 1..currents.len() {
-                                Self::project_pair_raw(p, i, currents[b] as usize);
-                            }
-                        }
-                        for (dx, dy) in [(1i32, 0i32), (-1, 1), (0, 1), (1, 1)] {
-                            let (nx, ny) = (x as i32 + dx, y as i32 + dy);
-                            if nx < 0 || nx >= GRID_W as i32 || ny >= GRID_H as i32 {
-                                continue;
-                            }
-                            for &i in currents {
-                                for &j in grid.cell(ny as usize * GRID_W + nx as usize) {
-                                    Self::project_pair_raw(p, i as usize, j as usize);
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            return;
-        }
-
-        // Sweep only occupied cells of the step-level CSR grid, visiting each
-        // unordered cell pair once via the forward half-stencil. Reusing the
-        // grid across solver iterations is safe: a particle moves far less
-        // than one 10 px cell within a single 1/480 s step, so the one-cell
-        // stencil still finds every potentially overlapping pair.
+    /// Gauss-Seidel sweep over occupied cells (forward half-stencil, each
+    /// unordered cell pair once). Fastest engine at serial particle counts.
+    fn resolve_collisions_serial(&mut self, c_pos: &mut [Vec2]) {
         for oc in 0..self.grid.occupied.len() {
             let cell = self.grid.occupied[oc] as usize;
             let (x, y) = (cell % GRID_W, cell / GRID_W);
@@ -942,8 +1009,7 @@ impl Physics {
         }
     }
 
-    fn check_wall_collisions(&mut self, c_pos: &mut [Vec2]) {
-        // Left and right border columns
+    fn check_wall_collisions_serial(&mut self, c_pos: &mut [Vec2]) {
         for y in 0..GRID_H {
             for &i in self.grid.cell(y * GRID_W) {
                 resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
@@ -952,8 +1018,6 @@ impl Physics {
                 resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
             }
         }
-
-        // Bottom and top border rows
         for x in 0..GRID_W {
             for &i in self.grid.cell(x) {
                 resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
@@ -961,6 +1025,65 @@ impl Physics {
             for &i in self.grid.cell((GRID_H - 1) * GRID_W + x) {
                 resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
             }
+        }
+    }
+
+    /// One Jacobi iteration of contact projection on the packed arrays:
+    /// gather every particle's half-corrections (read-only, so trivially
+    /// parallel and vectorizable), then apply them in one sweep.
+    fn resolve_collisions_packed(&mut self) {
+        let n = self.px.len();
+        self.acc_x.clear();
+        self.acc_x.resize(n, 0.0);
+        self.acc_y.clear();
+        self.acc_y.resize(n, 0.0);
+
+        {
+            let (grid, px, py, cells) = (&self.grid, &self.px, &self.py, &self.packed_cell);
+            let (acc_x, acc_y) = (&mut self.acc_x, &mut self.acc_y);
+            acc_x
+                .par_iter_mut()
+                .zip(acc_y.par_iter_mut())
+                .enumerate()
+                .for_each(|(k, (cx, cy))| {
+                    let rows = stencil_rows(&grid.cell_start, cells[k] as usize);
+                    let (gx, gy) = gather_correction(px[k], py[k], px, py, &rows);
+                    *cx = gx;
+                    *cy = gy;
+                });
+        }
+
+        for k in 0..n {
+            self.px[k] += self.acc_x[k];
+            self.py[k] += self.acc_y[k];
+        }
+    }
+
+    fn check_wall_collisions_packed(&mut self) {
+        // Left and right border columns
+        for y in 0..GRID_H {
+            self.wall_cell(y * GRID_W);
+            self.wall_cell(y * GRID_W + (GRID_W - 1));
+        }
+
+        // Bottom and top border rows
+        for x in 0..GRID_W {
+            self.wall_cell(x);
+            self.wall_cell((GRID_H - 1) * GRID_W + x);
+        }
+    }
+
+    /// Wall-project the packed particles of one (border) cell. `c_opos` is
+    /// still indexed by particle id — the grid indices map back.
+    fn wall_cell(&mut self, cell: usize) {
+        let start = self.grid.cell_start[cell] as usize;
+        let end = self.grid.cell_start[cell + 1] as usize;
+        for k in start..end {
+            let mut pos = Vec2::new(self.px[k], self.py[k]);
+            let i = self.grid.indices[k] as usize;
+            resolve_wall_collision(&mut pos, &mut self.c_opos[i]);
+            self.px[k] = pos.x;
+            self.py[k] = pos.y;
         }
     }
 

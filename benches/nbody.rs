@@ -36,6 +36,8 @@ struct RunResult {
     particles: usize,
     path: ForcePath,
     steps: usize,
+    /// mean µs/step: integrate, grid build, tree build, forces, solver
+    phase_means_us: [f64; 5],
     mean_us: f64,
     median_us: f64,
     p95_us: f64,
@@ -115,10 +117,17 @@ fn run_config(particles: usize, steps: usize, warmup: usize, path: ForcePath) ->
     }
 
     let mut step_times_us = Vec::with_capacity(steps);
+    let mut phase_sums_us = [0u64; 5]; // integrate, grid build, tree build, forces, solver
     for _ in 0..steps {
         let t = Instant::now();
         physics.step(PHYS_TIME_STEP, &mut share);
         step_times_us.push(t.elapsed().as_secs_f64() * 1e6);
+        let ps = &share.perf_stats;
+        phase_sums_us[0] += ps.integration_time_us;
+        phase_sums_us[1] += ps.neighbor_rebuild_time_us;
+        phase_sums_us[2] += ps.tree_build_time_us;
+        phase_sums_us[3] += ps.force_calc_time_us;
+        phase_sums_us[4] += ps.collision_time_us;
     }
 
     // Sanity checks: the optimizations must not blow up the simulation.
@@ -137,6 +146,7 @@ fn run_config(particles: usize, steps: usize, warmup: usize, path: ForcePath) ->
         particles,
         path,
         steps,
+        phase_means_us: phase_sums_us.map(|v| v as f64 / steps as f64),
         mean_us,
         median_us: pct(0.5),
         p95_us: pct(0.95),
@@ -154,6 +164,26 @@ fn main() {
     const REALTIME_BUDGET_US: f64 = 1e6 / 480.0;
 
     let quick = std::env::args().any(|a| a == "--quick");
+    let phases = std::env::args().any(|a| a == "--phases");
+    if phases {
+        println!("| particles | force path | integrate | grid build | tree build | forces | solver | total step (mean) |");
+        println!("|---|---|---|---|---|---|---|---|");
+        for &(particles, steps) in if quick {
+            &[(1_000usize, 120usize), (6_000, 40)][..]
+        } else {
+            &[(3_000, 200), (12_000, 60), (24_000, 40)][..]
+        } {
+            for path in [ForcePath::BarnesHut, ForcePath::VerletLists, ForcePath::SpatialHash] {
+                let r = run_config(particles, steps, steps / 10 + 5, path);
+                let p = r.phase_means_us;
+                println!(
+                    "| {} | {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} |",
+                    particles, path.label(), p[0], p[1], p[2], p[3], p[4], r.mean_us,
+                );
+            }
+        }
+        return;
+    }
     let configs: &[(usize, usize)] = if quick {
         &[(1_000, 120), (6_000, 40)]
     } else {
