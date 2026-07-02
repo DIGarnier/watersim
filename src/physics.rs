@@ -125,9 +125,10 @@ const BH_LEAF_CAP: u32 = 8;
 struct BhHot {
     center_of_mass: Vec2,
     total_mass: f32,
-    size_sq: f32,  // bounds.size()² cached for the sqrt-free acceptance test
-    children: u32, // BH_NONE = leaf, else index of first of 4 contiguous children
-    first: u32,    // head of this leaf's particle list (BH_NONE when empty)
+    size_sq: f32,   // bounds.size()² cached for the sqrt-free acceptance test
+    children: u32,  // BH_NONE = leaf, else index of first of 4 contiguous children
+    leaf_start: u32, // offset into the packed leaf-member arrays (set by finalize)
+    leaf_count: u32,
 }
 
 /// Arena-backed Barnes-Hut quadtree (Burtscher & Pingali 2011 style: contiguous
@@ -139,8 +140,13 @@ struct BhTree {
     hot: Vec<BhHot>,
     bounds: Vec<AABB>, // build-only
     count: Vec<u32>,   // build-only: particles in each leaf
+    first: Vec<u32>,   // build-only: head of each leaf's intrusive member list
     next: Vec<u32>,    // per-particle intrusive list linking leaf members
     ppos: Vec<Vec2>,   // per-particle (clamped) position as inserted
+    // Leaf members packed contiguously by finalize(): the near-field loop
+    // streams these instead of chasing next[] through scattered ppos.
+    leaf_x: Vec<f32>,
+    leaf_y: Vec<f32>,
 }
 
 impl BhTree {
@@ -149,8 +155,11 @@ impl BhTree {
             hot: Vec::new(),
             bounds: Vec::new(),
             count: Vec::new(),
+            first: Vec::new(),
             next: Vec::new(),
             ppos: Vec::new(),
+            leaf_x: Vec::new(),
+            leaf_y: Vec::new(),
         }
     }
 
@@ -160,19 +169,45 @@ impl BhTree {
             total_mass: 0.0,
             size_sq: bounds.size() * bounds.size(),
             children: BH_NONE,
-            first: BH_NONE,
+            leaf_start: 0,
+            leaf_count: 0,
         });
         self.bounds.push(bounds);
         self.count.push(0);
+        self.first.push(BH_NONE);
     }
 
     fn clear(&mut self, bounds: AABB, n_particles: usize) {
         self.hot.clear();
         self.bounds.clear();
         self.count.clear();
+        self.first.clear();
         self.push_node(bounds);
         self.next.resize(n_particles, BH_NONE);
         self.ppos.resize(n_particles, Vec2::ZERO);
+    }
+
+    /// Copy every leaf's members into the contiguous arrays and stamp the
+    /// (offset, count) into the hot nodes. One O(nodes + n) pass after build.
+    fn finalize(&mut self) {
+        self.leaf_x.clear();
+        self.leaf_y.clear();
+        for node in 0..self.hot.len() {
+            if self.hot[node].children != BH_NONE {
+                continue;
+            }
+            let start = self.leaf_x.len() as u32;
+            let mut p = self.first[node];
+            while p != BH_NONE {
+                let pos = self.ppos[p as usize];
+                self.leaf_x.push(pos.x);
+                self.leaf_y.push(pos.y);
+                p = self.next[p as usize];
+            }
+            let h = &mut self.hot[node];
+            h.leaf_start = start;
+            h.leaf_count = self.leaf_x.len() as u32 - start;
+        }
     }
 
     #[inline(always)]
@@ -207,8 +242,8 @@ impl BhTree {
 
             if self.count[node] < BH_LEAF_CAP || self.bounds[node].size() < MIN_CELL {
                 // Leaf with room: link the particle in and update the aggregate.
-                self.next[idx as usize] = n.first;
-                self.hot[node].first = idx;
+                self.next[idx as usize] = self.first[node];
+                self.first[node] = idx;
                 self.count[node] += 1;
                 Self::fold_into(&mut self.hot[node], pos, mass);
                 return;
@@ -222,22 +257,21 @@ impl BhTree {
                 self.push_node(node_bounds.quadrant(q));
             }
 
-            let mut p = n.first;
+            let mut p = self.first[node];
             let per_particle_mass = n.total_mass / self.count[node] as f32;
             while p != BH_NONE {
                 let p_next = self.next[p as usize];
                 let p_pos = self.ppos[p as usize];
                 let child = first_child as usize + Self::quadrant_index(&node_bounds, p_pos);
-                self.next[p as usize] = self.hot[child].first;
-                self.hot[child].first = p;
+                self.next[p as usize] = self.first[child];
+                self.first[child] = p;
                 self.count[child] += 1;
                 Self::fold_into(&mut self.hot[child], p_pos, per_particle_mass);
                 p = p_next;
             }
 
-            let nn = &mut self.hot[node];
-            nn.children = first_child;
-            nn.first = BH_NONE;
+            self.hot[node].children = first_child;
+            self.first[node] = BH_NONE;
             self.count[node] = 0;
         }
     }
@@ -280,16 +314,22 @@ impl BhTree {
                 }
                 stack.extend_from_slice(&[c, c + 1, c + 2, c + 3]);
             } else {
-                // Near leaf: exact particle-particle interactions.
-                let mut p = n.first;
-                while p != BH_NONE {
-                    let diff = self.ppos[p as usize] - pos;
-                    let d_sq = diff.length_squared();
-                    // Skip self-interaction and touching particles
-                    if d_sq >= BALL_SIZE * BALL_SIZE {
-                        force += diff * (scale * fast_rsqrt(d_sq) / d_sq.max(1.0));
-                    }
-                    p = self.next[p as usize];
+                // Near leaf: exact particle-particle interactions over the
+                // packed member slice — contiguous, branchless (masked), and
+                // free of the old next[]-chain dependent loads. Self and
+                // touching pairs mask out; the clamp keeps lanes finite.
+                const BALL_SQ: f32 = BALL_SIZE * BALL_SIZE;
+                let start = n.leaf_start as usize;
+                let end = start + n.leaf_count as usize;
+                for k in start..end {
+                    let dx = self.leaf_x[k] - pos.x;
+                    let dy = self.leaf_y[k] - pos.y;
+                    let d2 = dx * dx + dy * dy;
+                    let m = if d2 >= BALL_SQ { 1.0f32 } else { 0.0 };
+                    // active pairs have d2 ≥ BALL² > 1, so max(d2,1) == d2c
+                    let d2c = d2.max(BALL_SQ);
+                    let w = (scale * m) / (d2c.sqrt() * d2c);
+                    force += Vec2::new(dx * w, dy * w);
                 }
             }
         }
@@ -780,6 +820,7 @@ impl Physics {
             self.bh_tree
                 .insert(i as u32, pos.clamp(bounds.min, bounds.max), 1.0);
         }
+        self.bh_tree.finalize();
         stats.tree_build_time_us = t.elapsed().as_micros() as u64;
         stats.tree_node_count = self.bh_tree.hot.len();
 

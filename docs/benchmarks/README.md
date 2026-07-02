@@ -16,6 +16,8 @@ changes landed (each stage includes all previous ones):
 | 07 | [07-spatial-reorder.md](07-spatial-reorder.md) | periodic SFC-style particle reordering | neutral ≤24k (kept: free, scales) |
 | 08 | [08-bare-metal-kernels.md](08-bare-metal-kernels.md) | hardware rsqrt, store discipline, dead-work removal | 5–10% grid, ~5% BH |
 | 09 | [09-bh-hot-cold-split.md](09-bh-hot-cold-split.md) | BH node hot/cold split + prefetch | ~3% BH where visible |
+| 10 | [10-packed-simd-jacobi.md](10-packed-simd-jacobi.md) | phase profiling; packed-SoA Jacobi solver ≥16k (hybrid) | **−26/−27% at 24k**; solver shown to dominate grid paths |
+| 11 | [11-bh-packed-leaves.md](11-bh-packed-leaves.md) | contiguous BH leaf members | neutral (kept: structure, no pointer-chase) |
 
 ## Method
 
@@ -31,6 +33,11 @@ changes landed (each stage includes all previous ones):
   regressions/wins near that band were re-run A/B before being believed).
 
 ## End-to-end: baseline → final (median µs/step, stages 00 → 09)
+
+> Stages 10–11 were measured on a visibly slower VM day (stage-09 code re-ran
+> ~10–15% above its recorded numbers), so they are excluded from this table's
+> absolute values; their same-session deltas are in their own files. Net stage-10
+> effect at 24k: verlet 4689 → 3450, spatial 4204 → 3096 (same-day A/B).
 
 | particles | barnes-hut | verlet-lists | spatial-hash |
 |---|---|---|---|
@@ -55,6 +62,11 @@ neighbor lists during fast motion; 06 fixed that (see its write-up).
   needs the integrator's `a·dt` term fixed to `a·dt²` first (see 04).
 - **SFC particle reordering** is now in (stage 07), measured neutral ≤24k as
   predicted; its value is headroom past ~50k particles.
-- The remaining bare-metal lever is explicit SIMD batching of the pair kernels
-  (process 4–8 pairs per AVX2/AVX-512 lane, GROMACS cluster-pair style) — the
-  scalar kernels are now rsqrt-tight, so the next factor needs width.
+- Explicit SIMD batching of pair kernels was attempted in stage 10: it pays only
+  in the parallel regime (≥16k) — at this sim's density (~1–2 particles per cell)
+  packed rows are 3–6 elements, too short for SIMD to beat the scalar
+  Gauss-Seidel sweep at small N. Denser packing (GROMACS-style 4×4 clusters
+  independent of cell size) is the remaining width lever.
+- Per-phase timings (`cargo bench --no-default-features --bench nbody -- --phases`)
+  now show where each configuration spends its step; the solver dominates grid
+  paths, traversal dominates BH.
