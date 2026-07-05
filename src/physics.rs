@@ -1,4 +1,5 @@
-use ggez::glam::Vec2;
+use glam::Vec2;
+use rayon::prelude::*;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
@@ -10,12 +11,37 @@ const GRAVITY: Vec2 = Vec2::new(0.0, 9.8);
 pub const PHYS_TIME_STEP: f32 = 1.0 / 480.0;
 
 // Optimization constants
-const VERLET_REBUILD_INTERVAL: usize = 10; // Rebuild neighbor lists every N frames
 const VERLET_SKIN_DISTANCE: f32 = BALL_SIZE * 0.5; // Extra distance for neighbor lists
+// When neighbor lists have gone stale (something moved > skin/2), forces fall
+// back to the direct cell pass — which costs the same as the rebuild gather —
+// and a rebuild is only re-attempted this often, in case the system calmed
+// down enough for lists to stay valid again ("lazy Verlet").
+const VERLET_REBUILD_RETRY: usize = 16;
+
+// Physically permute the particle arrays into grid (spatial) order this often.
+// Keeps array neighbors ≈ spatial neighbors so the force/solver passes read
+// memory nearly sequentially (SFC reordering à la HOOMD-blue's SFCPACK;
+// docs/literature.md §4). O(n) copies, amortized to ~nothing.
+const REORDER_INTERVAL: usize = 64;
 const ADAPTIVE_DT_MIN: f32 = PHYS_TIME_STEP * 0.1;
 const ADAPTIVE_DT_MAX: f32 = PHYS_TIME_STEP * 2.0;
 const MAX_SAFE_VELOCITY: f32 = 100.0; // Reduce dt when velocities exceed this
 const BARNES_HUT_THETA: f32 = 0.5; // Barnes-Hut approximation parameter
+
+// Constraint-projection iterations per substep. The sim already substeps at
+// 480 Hz (8 substeps per 60 Hz visual frame); per "Small Steps in Physics
+// Simulation" (Macklin et al., SCA 2019) substeps are far more valuable than
+// solver iterations, so a small count here suffices (see
+// docs/benchmarks/04-small-steps.md for the measured speed/quality trade).
+const SOLVER_ITERATIONS: usize = 4;
+
+// Below this particle count the serial grid paths win (rayon region overhead
+// dominates small workloads). Re-tuned for the packed Jacobi engine, which
+// runs only 5 parallel regions per step (1 force pass + 4 solver iterations);
+// see docs/benchmarks/10-packed-simd-jacobi.md for the sweep. The Barnes-Hut
+// traversal has no threshold: it is one region of heavy independent work and
+// wins at every tested size.
+const PAR_MIN_PARTICLES: usize = 16_000;
 
 const LEFT_WALL: f32 = 0.;
 const RIGHT_WALL: f32 = WIDTH;
@@ -55,15 +81,6 @@ pub struct PerformanceStats {
     pub current_dt: f32,
 }
 
-// Barnes-Hut Quadtree node
-struct QuadNode {
-    bounds: AABB,
-    center_of_mass: Vec2,
-    total_mass: f32,
-    particle_idx: Option<usize>,
-    children: Option<Box<[QuadNode; 4]>>,
-}
-
 #[derive(Clone, Copy)]
 struct AABB {
     min: Vec2,
@@ -83,11 +100,6 @@ impl AABB {
         (self.max.x - self.min.x).max(self.max.y - self.min.y)
     }
 
-    fn contains(&self, point: Vec2) -> bool {
-        point.x >= self.min.x && point.x <= self.max.x &&
-        point.y >= self.min.y && point.y <= self.max.y
-    }
-
     fn quadrant(&self, idx: usize) -> AABB {
         let center = self.center();
         match idx {
@@ -100,145 +112,475 @@ impl AABB {
     }
 }
 
-impl QuadNode {
-    fn new(bounds: AABB) -> Self {
-        Self {
-            bounds,
-            center_of_mass: Vec2::ZERO,
-            total_mass: 0.0,
-            particle_idx: None,
-            children: None,
-        }
-    }
+const BH_NONE: u32 = u32::MAX;
 
-    fn insert(&mut self, pos: Vec2, mass: f32, idx: usize) -> bool {
-        if !self.bounds.contains(pos) {
-            return false;
-        }
+// Max particles per leaf before it subdivides. Bucketed leaves keep the tree
+// shallow and turn near-field work into tight exact loops (standard treecode
+// practice; see docs/literature.md §3).
+const BH_LEAF_CAP: u32 = 8;
 
-        // If this is a leaf node with no particle, store it here
-        if self.particle_idx.is_none() && self.children.is_none() {
-            self.particle_idx = Some(idx);
-            self.center_of_mass = pos;
-            self.total_mass = mass;
-            return true;
-        }
-
-        // If this leaf already has a particle, subdivide
-        if self.particle_idx.is_some() && self.children.is_none() {
-            let old_idx = self.particle_idx.take().unwrap();
-            let old_com = self.center_of_mass;
-            let old_mass = self.total_mass;
-
-            // Create children
-            self.children = Some(Box::new([
-                QuadNode::new(self.bounds.quadrant(0)),
-                QuadNode::new(self.bounds.quadrant(1)),
-                QuadNode::new(self.bounds.quadrant(2)),
-                QuadNode::new(self.bounds.quadrant(3)),
-            ]));
-
-            // Re-insert old particle
-            for child in self.children.as_mut().unwrap().iter_mut() {
-                if child.insert(old_com, old_mass, old_idx) {
-                    break;
-                }
-            }
-        }
-
-        // Insert new particle into appropriate child
-        if let Some(ref mut children) = self.children {
-            for child in children.iter_mut() {
-                if child.insert(pos, mass, idx) {
-                    // Update center of mass and total mass
-                    let total = self.total_mass + mass;
-                    self.center_of_mass = (self.center_of_mass * self.total_mass + pos * mass) / total;
-                    self.total_mass = total;
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
-    fn compute_force(&self, pos: Vec2, scale: f32, theta: f32) -> Vec2 {
-        if self.total_mass == 0.0 {
-            return Vec2::ZERO;
-        }
-
-        let diff = self.center_of_mass - pos;
-        let dist_sq = diff.length_squared();
-
-        // Avoid self-interaction
-        if dist_sq < 0.01 {
-            return Vec2::ZERO;
-        }
-
-        let dist = dist_sq.sqrt();
-        let size = self.bounds.size();
-
-        // If far enough or is a leaf, use approximation
-        if self.children.is_none() || (size / dist) < theta {
-            if dist < BALL_SIZE {
-                return Vec2::ZERO;
-            }
-            return (diff.normalize() * scale * self.total_mass) / dist_sq.max(1.0);
-        }
-
-        // Otherwise, recurse into children
-        let mut force = Vec2::ZERO;
-        if let Some(ref children) = self.children {
-            for child in children.iter() {
-                force += child.compute_force(pos, scale, theta);
-            }
-        }
-        force
-    }
-
-    fn count_nodes(&self) -> usize {
-        1 + self.children.as_ref()
-            .map(|c| c.iter().map(|child| child.count_nodes()).sum())
-            .unwrap_or(0)
-    }
+/// Traversal-hot node data: 24 bytes, so ~2.7 nodes per cache line versus 44
+/// bytes when bounds/count rode along. Force traversal touches only this.
+#[derive(Clone, Copy)]
+struct BhHot {
+    center_of_mass: Vec2,
+    total_mass: f32,
+    size_sq: f32,   // bounds.size()² cached for the sqrt-free acceptance test
+    children: u32,  // BH_NONE = leaf, else index of first of 4 contiguous children
+    leaf_start: u32, // offset into the packed leaf-member arrays (set by finalize)
+    leaf_count: u32,
 }
 
-// Verlet neighbor list for a particle
-struct NeighborList {
-    neighbors: Vec<usize>,
-    last_pos: Vec2,
+/// Arena-backed Barnes-Hut quadtree (Burtscher & Pingali 2011 style: contiguous
+/// node storage, no per-node allocation, non-recursive traversal). Node data is
+/// split hot/cold: `hot` is everything the force traversal reads; `bounds` and
+/// `count` exist only for tree construction. All buffers keep their capacity
+/// across frames, so steady-state tree builds are allocation-free.
+struct BhTree {
+    hot: Vec<BhHot>,
+    bounds: Vec<AABB>, // build-only
+    count: Vec<u32>,   // build-only: particles in each leaf
+    first: Vec<u32>,   // build-only: head of each leaf's intrusive member list
+    next: Vec<u32>,    // per-particle intrusive list linking leaf members
+    ppos: Vec<Vec2>,   // per-particle (clamped) position as inserted
+    // Leaf members packed contiguously by finalize(): the near-field loop
+    // streams these instead of chasing next[] through scattered ppos.
+    leaf_x: Vec<f32>,
+    leaf_y: Vec<f32>,
 }
 
-impl NeighborList {
+impl BhTree {
     fn new() -> Self {
         Self {
-            neighbors: Vec::new(),
-            last_pos: Vec2::ZERO,
+            hot: Vec::new(),
+            bounds: Vec::new(),
+            count: Vec::new(),
+            first: Vec::new(),
+            next: Vec::new(),
+            ppos: Vec::new(),
+            leaf_x: Vec::new(),
+            leaf_y: Vec::new(),
         }
     }
 
-    fn needs_rebuild(&self, current_pos: Vec2) -> bool {
-        (current_pos - self.last_pos).length() > VERLET_SKIN_DISTANCE * 0.5
+    fn push_node(&mut self, bounds: AABB) {
+        self.hot.push(BhHot {
+            center_of_mass: Vec2::ZERO,
+            total_mass: 0.0,
+            size_sq: bounds.size() * bounds.size(),
+            children: BH_NONE,
+            leaf_start: 0,
+            leaf_count: 0,
+        });
+        self.bounds.push(bounds);
+        self.count.push(0);
+        self.first.push(BH_NONE);
+    }
+
+    fn clear(&mut self, bounds: AABB, n_particles: usize) {
+        self.hot.clear();
+        self.bounds.clear();
+        self.count.clear();
+        self.first.clear();
+        self.push_node(bounds);
+        self.next.resize(n_particles, BH_NONE);
+        self.ppos.resize(n_particles, Vec2::ZERO);
+    }
+
+    /// Copy every leaf's members into the contiguous arrays and stamp the
+    /// (offset, count) into the hot nodes. One O(nodes + n) pass after build.
+    fn finalize(&mut self) {
+        self.leaf_x.clear();
+        self.leaf_y.clear();
+        for node in 0..self.hot.len() {
+            if self.hot[node].children != BH_NONE {
+                continue;
+            }
+            let start = self.leaf_x.len() as u32;
+            let mut p = self.first[node];
+            while p != BH_NONE {
+                let pos = self.ppos[p as usize];
+                self.leaf_x.push(pos.x);
+                self.leaf_y.push(pos.y);
+                p = self.next[p as usize];
+            }
+            let h = &mut self.hot[node];
+            h.leaf_start = start;
+            h.leaf_count = self.leaf_x.len() as u32 - start;
+        }
+    }
+
+    #[inline(always)]
+    fn quadrant_index(bounds: &AABB, pos: Vec2) -> usize {
+        let c = bounds.center();
+        ((pos.y >= c.y) as usize) * 2 + ((pos.x >= c.x) as usize)
+    }
+
+    #[inline(always)]
+    fn fold_into(hot: &mut BhHot, pos: Vec2, mass: f32) {
+        let total = hot.total_mass + mass;
+        hot.center_of_mass = (hot.center_of_mass * hot.total_mass + pos * mass) / total;
+        hot.total_mass = total;
+    }
+
+    fn insert(&mut self, idx: u32, pos: Vec2, mass: f32) {
+        // Below this cell size, keep piling particles into the leaf instead of
+        // subdividing forever (guards against (near-)coincident particles).
+        const MIN_CELL: f32 = 1e-3;
+
+        self.ppos[idx as usize] = pos;
+        let mut node = 0usize;
+        loop {
+            let n = self.hot[node];
+
+            if n.children != BH_NONE {
+                // Internal node: fold the new mass into the aggregate, descend.
+                Self::fold_into(&mut self.hot[node], pos, mass);
+                node = n.children as usize + Self::quadrant_index(&self.bounds[node], pos);
+                continue;
+            }
+
+            if self.count[node] < BH_LEAF_CAP || self.bounds[node].size() < MIN_CELL {
+                // Leaf with room: link the particle in and update the aggregate.
+                self.next[idx as usize] = self.first[node];
+                self.first[node] = idx;
+                self.count[node] += 1;
+                Self::fold_into(&mut self.hot[node], pos, mass);
+                return;
+            }
+
+            // Full leaf: subdivide and redistribute the residents, then retry
+            // this node (now internal) with the incoming particle.
+            let node_bounds = self.bounds[node];
+            let first_child = self.hot.len() as u32;
+            for q in 0..4 {
+                self.push_node(node_bounds.quadrant(q));
+            }
+
+            let mut p = self.first[node];
+            let per_particle_mass = n.total_mass / self.count[node] as f32;
+            while p != BH_NONE {
+                let p_next = self.next[p as usize];
+                let p_pos = self.ppos[p as usize];
+                let child = first_child as usize + Self::quadrant_index(&node_bounds, p_pos);
+                self.next[p as usize] = self.first[child];
+                self.first[child] = p;
+                self.count[child] += 1;
+                Self::fold_into(&mut self.hot[child], p_pos, per_particle_mass);
+                p = p_next;
+            }
+
+            self.hot[node].children = first_child;
+            self.first[node] = BH_NONE;
+            self.count[node] = 0;
+        }
+    }
+
+    /// Traversal is read-only so it can run for many particles in parallel;
+    /// callers supply a reusable scratch stack (one per thread).
+    fn compute_force(&self, pos: Vec2, scale: f32, theta: f32, stack: &mut Vec<u32>) -> Vec2 {
+        let theta_sq = theta * theta;
+        let mut force = Vec2::ZERO;
+        stack.clear();
+        stack.push(0);
+
+        while let Some(idx) = stack.pop() {
+            let n = &self.hot[idx as usize];
+            if n.total_mass == 0.0 {
+                continue;
+            }
+
+            let diff = n.center_of_mass - pos;
+            let dist_sq = diff.length_squared();
+
+            // size/dist < theta  <=>  size² < theta²·dist², sqrt-free
+            if n.size_sq < theta_sq * dist_sq {
+                // Far enough: use the aggregate (internal or leaf alike).
+                if dist_sq < BALL_SIZE * BALL_SIZE {
+                    continue;
+                }
+                // == normalize(diff) * scale * mass / max(dist², 1)
+                force += diff * (scale * n.total_mass * fast_rsqrt(dist_sq) / dist_sq.max(1.0));
+            } else if n.children != BH_NONE {
+                let c = n.children;
+                // The 4 children (96 B, contiguous) will be popped within the
+                // next few iterations; start their cache lines now.
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                    let p = self.hot.as_ptr().add(c as usize) as *const i8;
+                    _mm_prefetch(p, _MM_HINT_T0);
+                    _mm_prefetch(p.add(64), _MM_HINT_T0);
+                }
+                stack.extend_from_slice(&[c, c + 1, c + 2, c + 3]);
+            } else {
+                // Near leaf: exact particle-particle interactions over the
+                // packed member slice — contiguous, branchless (masked), and
+                // free of the old next[]-chain dependent loads. Self and
+                // touching pairs mask out; the clamp keeps lanes finite.
+                const BALL_SQ: f32 = BALL_SIZE * BALL_SIZE;
+                let start = n.leaf_start as usize;
+                let end = start + n.leaf_count as usize;
+                for k in start..end {
+                    let dx = self.leaf_x[k] - pos.x;
+                    let dy = self.leaf_y[k] - pos.y;
+                    let d2 = dx * dx + dy * dy;
+                    let m = if d2 >= BALL_SQ { 1.0f32 } else { 0.0 };
+                    // active pairs have d2 ≥ BALL² > 1, so max(d2,1) == d2c
+                    let d2c = d2.max(BALL_SQ);
+                    let w = (scale * m) / (d2c.sqrt() * d2c);
+                    force += Vec2::new(dx * w, dy * w);
+                }
+            }
+        }
+
+        force
     }
 }
 
-fn arbitrary_vector_field(mut pos: Vec2) -> Vec2 {
-    pos *= 0.01;
-    let dx = pos.x.sin();
-    let dy = pos.y.cos() * 10.0;
-    Vec2::new(dx, dy).perp() * 0.0 // dirty way of disabling it
+/// Verlet neighbor lists in flat CSR layout: one contiguous `neighbors` array
+/// with per-particle `start` offsets, instead of a Vec per particle. Rebuilt
+/// only when some particle has drifted more than half the skin distance from
+/// its position at build time (`ref_pos`) — the standard MD policy, which is
+/// both cheaper at rest and, unlike the old fixed every-10-frames cadence,
+/// can't miss fast-moving pairs.
+#[derive(Default)]
+struct VerletLists {
+    start: Vec<u32>,     // n+1 offsets into `neighbors`
+    neighbors: Vec<u32>, // flat neighbor ids
+    ref_pos: Vec<Vec2>,  // positions when the lists were built
+}
+
+impl VerletLists {
+    #[inline(always)]
+    fn of(&self, i: usize) -> &[u32] {
+        &self.neighbors[self.start[i] as usize..self.start[i + 1] as usize]
+    }
+
+    fn is_valid_for(&self, n: usize) -> bool {
+        self.start.len() == n + 1
+    }
+
+    fn needs_rebuild(&self, c_pos: &[Vec2]) -> bool {
+        if !self.is_valid_for(c_pos.len()) {
+            return true;
+        }
+        let limit_sq = (VERLET_SKIN_DISTANCE * 0.5) * (VERLET_SKIN_DISTANCE * 0.5);
+        c_pos
+            .iter()
+            .zip(&self.ref_pos)
+            .any(|(p, r)| (*p - *r).length_squared() > limit_sq)
+    }
+}
+
+// Grid dimensions as integers (X_LEN/Y_LEN are f32 for legacy reasons)
+const GRID_W: usize = X_LEN as usize;
+const GRID_H: usize = Y_LEN as usize;
+const N_CELLS: usize = GRID_W * GRID_H;
+
+/// Uniform grid in CSR layout, built with a counting sort (Green 2010,
+/// Hoetzlein 2014). One flat index array + per-cell start offsets instead of
+/// a heap-allocated Vec per cell. Built once per step and reused across all
+/// constraint-solver iterations (particles move far less than a cell per
+/// step, so the one-cell stencil acts as a Verlet skin).
+struct CsrGrid {
+    cell_start: Vec<u32>, // N_CELLS + 1 offsets into `indices`
+    cursor: Vec<u32>,     // scratch: per-cell write cursor / counts
+    cell_of: Vec<u32>,    // per-particle cell id
+    indices: Vec<u32>,    // particle ids grouped by cell
+    occupied: Vec<u32>,   // ids of non-empty cells, ascending
+}
+
+impl CsrGrid {
+    fn new() -> Self {
+        Self {
+            cell_start: vec![0; N_CELLS + 1],
+            cursor: vec![0; N_CELLS],
+            cell_of: Vec::new(),
+            indices: Vec::new(),
+            occupied: Vec::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn cell_id(pos: Vec2) -> u32 {
+        const INV_GRID_SIZE: f32 = 1.0 / GRID_SIZE;
+        // `as usize` saturates negatives to 0, matching the old clamping
+        let x = ((pos.x * INV_GRID_SIZE) as usize).min(GRID_W - 1);
+        let y = ((pos.y * INV_GRID_SIZE) as usize).min(GRID_H - 1);
+        (y * GRID_W + x) as u32
+    }
+
+    fn build(&mut self, positions: &[Vec2]) {
+        let n = positions.len();
+        self.cell_of.resize(n, 0);
+        self.indices.resize(n, 0);
+        self.cursor.fill(0);
+
+        for (i, p) in positions.iter().enumerate() {
+            let c = Self::cell_id(*p);
+            self.cell_of[i] = c;
+            self.cursor[c as usize] += 1;
+        }
+
+        let mut sum = 0u32;
+        self.occupied.clear();
+        for c in 0..N_CELLS {
+            let count = self.cursor[c];
+            self.cell_start[c] = sum;
+            self.cursor[c] = sum;
+            if count > 0 {
+                self.occupied.push(c as u32);
+            }
+            sum += count;
+        }
+        self.cell_start[N_CELLS] = sum;
+
+        for i in 0..n {
+            let c = self.cell_of[i] as usize;
+            self.indices[self.cursor[c] as usize] = i as u32;
+            self.cursor[c] += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn cell(&self, c: usize) -> &[u32] {
+        &self.indices[self.cell_start[c] as usize..self.cell_start[c + 1] as usize]
+    }
+}
+
+/// Hardware reciprocal square root (SSE `rsqrtss`, ~12-bit) refined with one
+/// Newton-Raphson step to ~22 bits — plenty for force directions and contact
+/// normals, and much cheaper than `sqrt` + `div`. Callers must keep x > 0.
+#[inline(always)]
+fn fast_rsqrt(x: f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::{_mm_cvtss_f32, _mm_rsqrt_ss, _mm_set_ss};
+        let y = unsafe { _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(x))) };
+        y * (1.5 - 0.5 * x * y * y)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        x.sqrt().recip()
+    }
+}
+
+/// The 3 contiguous packed ranges covering a cell's 3×3 neighborhood: cells
+/// x−1..=x+1 of one row are adjacent in row-major order, so their CSR ranges
+/// concatenate (empty cells contribute empty subranges for free). This is what
+/// makes the packed kernels below stream memory sequentially and vectorize.
+#[inline(always)]
+fn stencil_rows(cell_start: &[u32], cell: usize) -> [(usize, usize); 3] {
+    let (x, y) = (cell % GRID_W, cell / GRID_W);
+    let x0 = x.saturating_sub(1);
+    let x1 = (x + 1).min(GRID_W - 1);
+    let mut rows = [(0usize, 0usize); 3];
+    for dy in 0..3usize {
+        let yy = y as i32 + dy as i32 - 1;
+        if yy >= 0 && yy < GRID_H as i32 {
+            let base = yy as usize * GRID_W;
+            rows[dy] = (
+                cell_start[base + x0] as usize,
+                cell_start[base + x1 + 1] as usize,
+            );
+        }
+    }
+    rows
+}
+
+/// Repulsion force gather over packed row slices, branchless so LLVM can
+/// vectorize the inner loop. `s8` = scale/8 (the historical accumulation
+/// factor). Self-interaction masks out via d² < BALL_SIZE² like any touching
+/// pair; the clamped denominator keeps masked lanes finite (never NaN·0).
+#[inline(always)]
+fn gather_force(
+    xa: f32,
+    ya: f32,
+    px: &[f32],
+    py: &[f32],
+    rows: &[(usize, usize); 3],
+    s8: f32,
+) -> (f32, f32) {
+    const BALL_SQ: f32 = BALL_SIZE * BALL_SIZE;
+    let mut fx = 0.0f32;
+    let mut fy = 0.0f32;
+    for &(start, end) in rows {
+        for k in start..end {
+            let dx = xa - px[k];
+            let dy = ya - py[k];
+            let d2 = dx * dx + dy * dy;
+            let m = if d2 >= BALL_SQ { 1.0f32 } else { 0.0 };
+            // active pairs have d2 ≥ BALL² > 1, so max(d2,1) == d2 here
+            let d2c = d2.max(BALL_SQ);
+            let w = (s8 * m) / (d2c.sqrt() * d2c);
+            fx += dx * w;
+            fy += dy * w;
+        }
+    }
+    (fx, fy)
+}
+
+/// One Jacobi half-correction gather for the contact solver: the particle
+/// accumulates its half of every overlapping pair's separation; the partner
+/// accumulates the other half in its own gather. Same per-iteration pair
+/// correction as the old Gauss-Seidel sweep, but order-independent, so it
+/// vectorizes and parallelizes with no cell coloring.
+#[inline(always)]
+fn gather_correction(
+    xa: f32,
+    ya: f32,
+    px: &[f32],
+    py: &[f32],
+    rows: &[(usize, usize); 3],
+) -> (f32, f32) {
+    const CONTACT: f32 = BALL_SIZE + BALL_SIZE;
+    let mut cx = 0.0f32;
+    let mut cy = 0.0f32;
+    for &(start, end) in rows {
+        for k in start..end {
+            let dx = xa - px[k];
+            let dy = ya - py[k];
+            let d2 = dx * dx + dy * dy;
+            // Excludes self (d2 == 0) and coincident pairs, like the old
+            // try_normalize() -> ZERO path.
+            let m = if d2 < CONTACT * CONTACT && d2 > 1e-12 {
+                1.0f32
+            } else {
+                0.0
+            };
+            let d2c = d2.max(1e-12);
+            let inv = 1.0 / d2c.sqrt();
+            let dist = d2c * inv;
+            // == normalized(axis) * 0.75 * (dist - CONTACT) / 2, masked
+            let term = m * 0.375 * (dist - CONTACT) * inv;
+            cx -= dx * term;
+            cy -= dy * term;
+        }
+    }
+    (cx, cy)
 }
 
 pub struct Physics {
     c_opos: Vec<Vec2>,
     c_force: Vec<Vec2>,
-    table: Vec<Vec<usize>>,
-    others: Vec<usize>,
+    grid: CsrGrid,
+    bh_tree: BhTree,
     pub rx: Receiver<EventToPthread>,
     pub scale: f32,
 
     // Optimization structures
-    neighbor_lists: Vec<NeighborList>,
+    neighbor_lists: VerletLists,
+    stale_steps: usize,
+    scratch_v2: Vec<Vec2>,
+    scratch_f: Vec<f32>,
+    // Packed SoA state in CSR (cell) order, rebuilt each step: positions for
+    // the force/solver kernels plus a shared accumulator pair.
+    px: Vec<f32>,
+    py: Vec<f32>,
+    acc_x: Vec<f32>,
+    acc_y: Vec<f32>,
+    packed_cell: Vec<u32>,
     frame_count: usize,
     use_barnes_hut: bool,
     use_verlet_lists: bool,
@@ -253,19 +595,25 @@ impl Physics {
     pub fn new(
         c_opos: Vec<Vec2>,
         c_force: Vec<Vec2>,
-        table: Vec<Vec<usize>>,
-        others: Vec<usize>,
         rx: Receiver<EventToPthread>,
         scale: f32,
     ) -> Self {
         Self {
             c_opos,
             c_force,
-            table,
-            others,
+            grid: CsrGrid::new(),
+            bh_tree: BhTree::new(),
             rx,
             scale,
-            neighbor_lists: Vec::new(),
+            neighbor_lists: VerletLists::default(),
+            stale_steps: 0,
+            scratch_v2: Vec::new(),
+            scratch_f: Vec::new(),
+            px: Vec::new(),
+            py: Vec::new(),
+            acc_x: Vec::new(),
+            acc_y: Vec::new(),
+            packed_cell: Vec::new(),
             frame_count: 0,
             use_barnes_hut: true,  // Enable Barnes-Hut by default
             use_verlet_lists: true, // Enable Verlet lists by default
@@ -284,7 +632,21 @@ impl Physics {
         };
 
         self.integrate(effective_dt, share);
-        self.check_ball_collisions(&mut share.c_pos);
+
+        // Build the CSR grid once per step; forces and all solver iterations
+        // reuse it (positions move a small fraction of a cell per step).
+        let t = Instant::now();
+        self.grid.build(&share.c_pos);
+        share.perf_stats.neighbor_rebuild_time_us = t.elapsed().as_micros() as u64;
+
+        if self.frame_count % REORDER_INTERVAL == 0 {
+            self.reorder_particles(share);
+        }
+
+        let ShareData {
+            c_pos, perf_stats, ..
+        } = share;
+        self.check_ball_collisions(c_pos, perf_stats);
 
         self.frame_count += 1;
 
@@ -308,273 +670,461 @@ impl Physics {
 
     fn integrate(&mut self, dt: f32, share: &mut ShareData) {
         let start = Instant::now();
-        let mut max_velocity: f32 = 0.0;
+        let mut max_velocity_sq: f32 = 0.0;
+
+        // Colors are only consumed by the 60 Hz renderer; recomputing them
+        // (one sqrt + fmod per particle) on all 8 substeps per frame is waste.
+        let update_colors = self.frame_count % 8 == 0;
 
         for i in 0..share.c_pos.len() {
             let c_pos = &mut share.c_pos[i];
             let c_opos = &mut self.c_opos[i];
-            let c_color = &mut share.c_color[i];
             let c_force = &mut self.c_force[i];
 
             let oldnpos = *c_pos;
             let velocity = (*c_pos - *c_opos) * 20.;
-            let vel_length = velocity.length();
-            *c_color = (vel_length + 198.) % 360.;
+            let vel_sq = velocity.length_squared();
+
+            if update_colors {
+                share.c_color[i] = (vel_sq.sqrt() + 198.) % 360.;
+            }
 
             // Track maximum velocity for adaptive time-stepping
-            max_velocity = max_velocity.max(vel_length);
+            max_velocity_sq = max_velocity_sq.max(vel_sq);
 
-            *c_pos =
-                *c_pos * 2.0 - *c_opos + (arbitrary_vector_field(*c_pos) + GRAVITY + *c_force) * dt;
+            // NOTE: the old code also added arbitrary_vector_field(pos) here,
+            // which is defined to return exactly ZERO (`* 0.0`) but still paid
+            // a sin + cos per particle per substep.
+            *c_pos = *c_pos * 2.0 - *c_opos + (GRAVITY + *c_force) * dt;
             *c_opos = oldnpos;
             *c_force = Vec2::ZERO;
         }
 
-        self.last_max_velocity = max_velocity;
+        self.last_max_velocity = max_velocity_sq.sqrt();
         share.perf_stats.integration_time_us = start.elapsed().as_micros() as u64;
     }
 
-    fn check_ball_collisions(&mut self, c_pos: &mut [Vec2]) {
-        let _collision_start = Instant::now();
+    /// Permute all per-particle arrays into grid order (the grid's `indices`
+    /// is exactly that permutation), then patch the grid back to identity.
+    fn reorder_particles(&mut self, share: &mut ShareData) {
+        let n = share.c_pos.len();
+        if n == 0 {
+            return;
+        }
+
+        let perm = &self.grid.indices;
+        let permute_v2 = |src: &mut Vec<Vec2>, scratch: &mut Vec<Vec2>| {
+            scratch.clear();
+            scratch.extend(perm.iter().map(|&p| src[p as usize]));
+            std::mem::swap(src, scratch);
+        };
+
+        permute_v2(&mut share.c_pos, &mut self.scratch_v2);
+        permute_v2(&mut self.c_opos, &mut self.scratch_v2);
+        permute_v2(&mut self.c_force, &mut self.scratch_v2);
+
+        self.scratch_f.clear();
+        self.scratch_f
+            .extend(perm.iter().map(|&p| share.c_color[p as usize]));
+        std::mem::swap(&mut share.c_color, &mut self.scratch_f);
+
+        // Grid order is now array order; cell assignments are unchanged.
+        for (k, (idx, cell)) in self
+            .grid
+            .indices
+            .iter_mut()
+            .zip(&mut self.grid.cell_of)
+            .enumerate()
+        {
+            *idx = k as u32;
+            *cell = CsrGrid::cell_id(share.c_pos[k]);
+        }
+
+        // Particle indices changed; stored neighbor lists are meaningless now.
+        // Prime the lazy-rebuild counter so list mode resumes on the very next
+        // force pass instead of waiting out the retry interval.
+        self.neighbor_lists.start.clear();
+        self.stale_steps = VERLET_REBUILD_RETRY - 1;
+    }
+
+    fn check_ball_collisions(&mut self, c_pos: &mut [Vec2], stats: &mut PerformanceStats) {
+        // Two solver engines (see docs/benchmarks/10-packed-simd-jacobi.md):
+        // below the parallel threshold, the scalar Gauss-Seidel half-stencil
+        // sweep on c_pos wins (cells hold ~1-2 particles, so packed rows are
+        // too short for SIMD, and the Jacobi gather does every pair twice).
+        // At scale, the packed Jacobi engine wins: positions packed once into
+        // CSR-ordered SoA, gathers are order-independent, and a step needs
+        // only 5 parallel regions instead of 24 colored ones.
+        let packed = c_pos.len() >= PAR_MIN_PARTICLES;
+        if packed {
+            self.pack_positions(c_pos);
+        }
 
         // Use Barnes-Hut for force calculation if enabled
+        let t = Instant::now();
         if self.use_barnes_hut {
-            self.compute_forces_barnes_hut(c_pos);
+            self.compute_forces_barnes_hut(c_pos, stats);
         } else {
             self.compute_forces_naive(c_pos);
         }
+        stats.force_calc_time_us = t.elapsed().as_micros() as u64;
 
         // Handle collisions using constraint solver
-        for _ in 0..8 {
-            self.resolve_collisions(c_pos);
-            self.check_wall_collisions(c_pos);
+        let t = Instant::now();
+        if packed {
+            for _ in 0..SOLVER_ITERATIONS {
+                self.resolve_collisions_packed();
+                self.check_wall_collisions_packed();
+            }
+            self.scatter_positions(c_pos);
+        } else {
+            for _ in 0..SOLVER_ITERATIONS {
+                self.resolve_collisions_serial(c_pos);
+                self.check_wall_collisions_serial(c_pos);
+            }
+        }
+        stats.collision_time_us = t.elapsed().as_micros() as u64;
+    }
+
+    fn pack_positions(&mut self, c_pos: &[Vec2]) {
+        let grid = &self.grid;
+        self.px.clear();
+        self.py.clear();
+        self.packed_cell.clear();
+        self.px
+            .extend(grid.indices.iter().map(|&i| c_pos[i as usize].x));
+        self.py
+            .extend(grid.indices.iter().map(|&i| c_pos[i as usize].y));
+        self.packed_cell
+            .extend(grid.indices.iter().map(|&i| grid.cell_of[i as usize]));
+    }
+
+    fn scatter_positions(&self, c_pos: &mut [Vec2]) {
+        for (k, &i) in self.grid.indices.iter().enumerate() {
+            c_pos[i as usize] = Vec2::new(self.px[k], self.py[k]);
         }
     }
 
-    fn compute_forces_barnes_hut(&mut self, c_pos: &[Vec2]) {
-        // Build Barnes-Hut tree
+    fn compute_forces_barnes_hut(&mut self, c_pos: &[Vec2], stats: &mut PerformanceStats) {
+        // Rebuild the arena tree (capacity persists across frames)
+        let t = Instant::now();
         let bounds = AABB::new(
             Vec2::new(LEFT_WALL, BOTTOM_WALL),
             Vec2::new(RIGHT_WALL, TOP_WALL),
         );
-        let mut tree = QuadNode::new(bounds);
+        self.bh_tree.clear(bounds, c_pos.len());
 
         for (i, &pos) in c_pos.iter().enumerate() {
-            tree.insert(pos, 1.0, i); // Assume unit mass for all particles
+            // The old tree silently dropped out-of-bounds particles; clamping
+            // keeps them contributing from the nearest edge instead.
+            self.bh_tree
+                .insert(i as u32, pos.clamp(bounds.min, bounds.max), 1.0);
         }
+        self.bh_tree.finalize();
+        stats.tree_build_time_us = t.elapsed().as_micros() as u64;
+        stats.tree_node_count = self.bh_tree.hot.len();
 
-        // Compute forces using the tree
-        for i in 0..c_pos.len() {
-            let force = tree.compute_force(c_pos[i], self.scale, BARNES_HUT_THETA);
-            self.c_force[i] += force / 8.0;
-        }
+        // Independent read-only traversals: parallelize over particles with a
+        // per-thread scratch stack.
+        let (tree, scale) = (&self.bh_tree, self.scale);
+        self.c_force
+            .par_iter_mut()
+            .enumerate()
+            .for_each_init(
+                || Vec::with_capacity(256),
+                |stack, (i, f)| {
+                    *f += tree.compute_force(c_pos[i], scale, BARNES_HUT_THETA, stack) / 8.0;
+                },
+            );
     }
 
     fn compute_forces_naive(&mut self, c_pos: &[Vec2]) {
-        // Use spatial hashing as before
-        if self.use_verlet_lists && self.should_rebuild_neighbors() {
-            self.rebuild_neighbor_lists(c_pos);
+        if self.use_verlet_lists {
+            if !self.neighbor_lists.needs_rebuild(c_pos) {
+                self.stale_steps = 0;
+                self.compute_forces_with_verlet_lists(c_pos);
+                return;
+            }
+            // Lists are stale. Rebuilding every step under fast motion costs
+            // more than the direct cell pass, so only re-attempt list mode
+            // periodically; otherwise take the direct path this step.
+            self.stale_steps += 1;
+            if self.stale_steps >= VERLET_REBUILD_RETRY {
+                self.stale_steps = 0;
+                self.rebuild_neighbor_lists(c_pos);
+                self.compute_forces_with_verlet_lists(c_pos);
+                return;
+            }
         }
-
-        if self.use_verlet_lists && !self.neighbor_lists.is_empty() {
-            self.compute_forces_with_verlet_lists(c_pos);
-        } else {
-            self.compute_forces_with_spatial_hash(c_pos);
-        }
-    }
-
-    fn should_rebuild_neighbors(&self) -> bool {
-        self.frame_count % VERLET_REBUILD_INTERVAL == 0 ||
-        self.neighbor_lists.len() != self.c_force.len()
+        self.compute_forces_with_spatial_hash(c_pos);
     }
 
     fn rebuild_neighbor_lists(&mut self, c_pos: &[Vec2]) {
-        // Resize neighbor lists if needed
-        self.neighbor_lists.resize_with(c_pos.len(), NeighborList::new);
+        // The step-level CSR grid is already built; gather from it into the
+        // flat CSR lists (built in particle order, so a single append pass).
+        let lists = &mut self.neighbor_lists;
+        lists.start.resize(c_pos.len() + 1, 0);
+        lists.neighbors.clear();
+        lists.ref_pos.clear();
+        lists.ref_pos.extend_from_slice(c_pos);
 
-        // Build spatial hash for neighbor finding
-        for i in 0..(X_LEN * Y_LEN) as usize {
-            self.table[i].clear();
-        }
-
-        for (i, pos_a) in c_pos.iter().enumerate() {
-            let y = (pos_a.y / GRID_SIZE).min(Y_LEN - 1.0) as usize;
-            let x = (pos_a.x / GRID_SIZE).min(X_LEN - 1.0) as usize;
-            self.table[y * X_LEN as usize + x].push(i);
-        }
-
-        // Build neighbor lists
-        let interaction_range = BALL_SIZE * 2.0 + VERLET_SKIN_DISTANCE;
+        let interaction_range_sq =
+            (BALL_SIZE * 2.0 + VERLET_SKIN_DISTANCE) * (BALL_SIZE * 2.0 + VERLET_SKIN_DISTANCE);
         for i in 0..c_pos.len() {
-            self.neighbor_lists[i].neighbors.clear();
-            self.neighbor_lists[i].last_pos = c_pos[i];
+            lists.start[i] = lists.neighbors.len() as u32;
 
-            let y = (c_pos[i].y / GRID_SIZE).min(Y_LEN - 1.0) as usize;
-            let x = (c_pos[i].x / GRID_SIZE).min(X_LEN - 1.0) as usize;
+            let cell = self.grid.cell_of[i] as usize;
+            let (x, y) = (cell % GRID_W, cell / GRID_W);
 
-            // Check neighboring cells
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    let ny = (y as i32 + dy).clamp(0, (Y_LEN - 1.0) as i32) as usize;
-                    let nx = (x as i32 + dx).clamp(0, (X_LEN - 1.0) as i32) as usize;
-
-                    for &j in &self.table[ny * X_LEN as usize + nx] {
-                        if i != j && (c_pos[i] - c_pos[j]).length() < interaction_range {
-                            self.neighbor_lists[i].neighbors.push(j);
+            for dy in -1i32..=1 {
+                let ny = y as i32 + dy;
+                if ny < 0 || ny >= GRID_H as i32 {
+                    continue;
+                }
+                for dx in -1i32..=1 {
+                    let nx = x as i32 + dx;
+                    if nx < 0 || nx >= GRID_W as i32 {
+                        continue;
+                    }
+                    for &j in self.grid.cell(ny as usize * GRID_W + nx as usize) {
+                        if i != j as usize
+                            && (c_pos[i] - c_pos[j as usize]).length_squared()
+                                < interaction_range_sq
+                        {
+                            lists.neighbors.push(j);
                         }
                     }
                 }
             }
         }
+        lists.start[c_pos.len()] = lists.neighbors.len() as u32;
     }
 
     fn compute_forces_with_verlet_lists(&mut self, c_pos: &[Vec2]) {
-        for i in 0..c_pos.len() {
-            for &j in &self.neighbor_lists[i].neighbors {
-                if i < j {
-                    let f = force(c_pos[i], c_pos[j], self.scale) / 8.0;
-                    self.c_force[i] += f;
-                    self.c_force[j] -= f; // Newton's third law
+        if c_pos.len() >= PAR_MIN_PARTICLES {
+            // Parallel gather: each particle sums its full (symmetric) neighbor
+            // list, so no cross-thread writes. Twice the arithmetic of the
+            // Newton's-third-law scatter, but it parallelizes cleanly.
+            let (c_force, lists, scale) = (&mut self.c_force, &self.neighbor_lists, self.scale);
+            c_force.par_iter_mut().enumerate().for_each(|(i, f)| {
+                let mut acc = Vec2::ZERO;
+                for &j in lists.of(i) {
+                    acc += force(c_pos[i], c_pos[j as usize], scale);
+                }
+                *f += acc / 8.0;
+            });
+        } else {
+            for i in 0..c_pos.len() {
+                for &j in self.neighbor_lists.of(i) {
+                    let j = j as usize;
+                    if i < j {
+                        let f = force(c_pos[i], c_pos[j], self.scale) / 8.0;
+                        self.c_force[i] += f;
+                        self.c_force[j] -= f; // Newton's third law
+                    }
                 }
             }
         }
     }
 
     fn compute_forces_with_spatial_hash(&mut self, c_pos: &[Vec2]) {
-        // Original spatial hash approach
-        for i in 0..(X_LEN * Y_LEN) as usize {
-            self.table[i].clear();
+        let n = c_pos.len();
+        if n >= PAR_MIN_PARTICLES {
+            // Packed parallel gather over the CSR-ordered SoA arrays.
+            let s8 = self.scale / 8.0;
+            self.acc_x.clear();
+            self.acc_x.resize(n, 0.0);
+            self.acc_y.clear();
+            self.acc_y.resize(n, 0.0);
+
+            {
+                let (grid, px, py, cells) = (&self.grid, &self.px, &self.py, &self.packed_cell);
+                let (acc_x, acc_y) = (&mut self.acc_x, &mut self.acc_y);
+                acc_x
+                    .par_iter_mut()
+                    .zip(acc_y.par_iter_mut())
+                    .enumerate()
+                    .for_each(|(k, (fx, fy))| {
+                        let rows = stencil_rows(&grid.cell_start, cells[k] as usize);
+                        let (gx, gy) = gather_force(px[k], py[k], px, py, &rows, s8);
+                        *fx = gx;
+                        *fy = gy;
+                    });
+            }
+
+            for (k, &i) in self.grid.indices.iter().enumerate() {
+                self.c_force[i as usize] += Vec2::new(self.acc_x[k], self.acc_y[k]);
+            }
+            return;
         }
 
-        for (i, pos_a) in c_pos.iter().enumerate() {
-            let y = (pos_a.y / GRID_SIZE).min(Y_LEN - 1.0) as usize;
-            let x = (pos_a.x / GRID_SIZE).min(X_LEN - 1.0) as usize;
-            self.table[y * X_LEN as usize + x].push(i);
-        }
+        // Half-neighborhood sweep over occupied CSR cells: each unordered cell
+        // pair is visited once and Newton's third law is applied per pair.
+        for oc in 0..self.grid.occupied.len() {
+            let cell = self.grid.occupied[oc] as usize;
+            let (x, y) = (cell % GRID_W, cell / GRID_W);
+            let currents = self.grid.cell(cell);
 
-        for y in 0..(Y_LEN) as usize {
-            for x in 0..(X_LEN) as usize {
-                self.others.clear();
-                let currents = &self.table[y * X_LEN as usize + x];
-
-                for dy in [-1, 0, 1] {
-                    for dx in [-1, 0, 1] {
-                        if dx == 0 && dy == 0 {
-                            continue;
-                        }
-                        let ny = (y as i32 + dy).clamp(0, Y_LEN as i32) as usize;
-                        let nx = (x as i32 + dx).clamp(0, X_LEN as i32) as usize;
-                        self.others.extend(&self.table[ny * X_LEN as usize + nx]);
-                    }
-                }
-
-                for i in 0..currents.len() {
-                    let pos_a = c_pos[currents[i]];
-                    for j in i + 1..currents.len() {
-                        let pos_b = c_pos[currents[j]];
-                        self.c_force[currents[i]] += force(pos_a, pos_b, self.scale) / 8.0;
-                    }
-
-                    for j in 0..self.others.len() {
-                        let pos_b = c_pos[self.others[j]];
-                        if pos_a != pos_b {
-                            self.c_force[currents[i]] += force(pos_a, pos_b, self.scale) / 8.0;
-                        }
-                    }
+            // Pairs within the cell
+            for a in 0..currents.len() {
+                let i = currents[a] as usize;
+                for b in a + 1..currents.len() {
+                    let j = currents[b] as usize;
+                    let f = force(c_pos[i], c_pos[j], self.scale) / 8.0;
+                    self.c_force[i] += f;
+                    self.c_force[j] -= f;
                 }
             }
-        }
-    }
 
-    fn resolve_collisions(&mut self, c_pos: &mut [Vec2]) {
-        // Rebuild spatial hash for collision detection
-        for i in 0..(X_LEN * Y_LEN) as usize {
-            self.table[i].clear();
-        }
-
-        for (i, pos_a) in c_pos.iter().enumerate() {
-            let y = (pos_a.y / GRID_SIZE).min(Y_LEN - 1.0) as usize;
-            let x = (pos_a.x / GRID_SIZE).min(X_LEN - 1.0) as usize;
-            self.table[y * X_LEN as usize + x].push(i);
-        }
-
-        for y in 0..(Y_LEN) as usize {
-            for x in 0..(X_LEN) as usize {
-                self.others.clear();
-                let currents = &self.table[y * X_LEN as usize + x];
-
-                for dy in [-1, 0, 1] {
-                    for dx in [-1, 0, 1] {
-                        if dx == 0 && dy == 0 {
-                            continue;
-                        }
-                        let ny = (y as i32 + dy).clamp(0, Y_LEN as i32) as usize;
-                        let nx = (x as i32 + dx).clamp(0, X_LEN as i32) as usize;
-                        self.others.extend(&self.table[ny * X_LEN as usize + nx]);
-                    }
+            // Forward half-stencil: E, SW, S, SE
+            for (dx, dy) in [(1i32, 0i32), (-1, 1), (0, 1), (1, 1)] {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx < 0 || nx >= GRID_W as i32 || ny >= GRID_H as i32 {
+                    continue;
                 }
-
-                for i in 0..currents.len() {
-                    let pos_a = c_pos[currents[i]];
-                    for j in i + 1..currents.len() {
-                        let pos_b = c_pos[currents[j]];
-
-                        if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
-                            let mut col_axis = pos_a - pos_b;
-                            let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
-                            col_axis = col_axis
-                                .try_normalize()
-                                .unwrap_or_else(|| Vec2::new(0., 0.));
-                            c_pos[currents[i]] -= col_axis * mvt / 2.0;
-                            c_pos[currents[j]] += col_axis * mvt / 2.0;
-                        }
-                    }
-
-                    for j in 0..self.others.len() {
-                        let pos_b = c_pos[self.others[j]];
-
-                        if pos_a == pos_b {
-                            continue;
-                        }
-
-                        if ball_collides(pos_a, BALL_SIZE, pos_b, BALL_SIZE) {
-                            let mut col_axis = pos_a - pos_b;
-                            let mvt = 0.75 * (col_axis.length() - (BALL_SIZE + BALL_SIZE));
-                            col_axis = col_axis
-                                .try_normalize()
-                                .unwrap_or_else(|| Vec2::new(0., 0.));
-                            c_pos[currents[i]] -= col_axis * mvt / 2.0;
-                            c_pos[self.others[j]] += col_axis * mvt / 2.0;
-                        }
+                for &i in currents {
+                    let i = i as usize;
+                    for &j in self.grid.cell(ny as usize * GRID_W + nx as usize) {
+                        let j = j as usize;
+                        let f = force(c_pos[i], c_pos[j], self.scale) / 8.0;
+                        self.c_force[i] += f;
+                        self.c_force[j] -= f;
                     }
                 }
             }
         }
     }
 
-    fn check_wall_collisions(&mut self, c_pos: &mut [Vec2]) {
-        for y in 0..(Y_LEN) as usize {
-            for &i in self.table[y * X_LEN as usize].iter() {
-                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
+    /// Half the positional correction for an overlapping pair, or None for
+    /// the common non-overlapping case — callers skip the position stores
+    /// entirely then. One rsqrt replaces length() + try_normalize().
+    #[inline(always)]
+    fn pair_correction(pos_a: Vec2, pos_b: Vec2) -> Option<Vec2> {
+        const CONTACT: f32 = BALL_SIZE + BALL_SIZE;
+        let col_axis = pos_a - pos_b;
+        let dist_sq = col_axis.length_squared();
+        // Degenerate coincident pair: old try_normalize() produced ZERO.
+        if dist_sq >= CONTACT * CONTACT || dist_sq < 1e-12 {
+            return None;
+        }
+        let inv_dist = fast_rsqrt(dist_sq);
+        let dist = dist_sq * inv_dist;
+        // == normalized(col_axis) * 0.75 * (dist - CONTACT) / 2
+        Some(col_axis * (inv_dist * 0.375 * (dist - CONTACT)))
+    }
+
+    #[inline(always)]
+    fn project_pair(c_pos: &mut [Vec2], i: usize, j: usize) {
+        if let Some(corr) = Self::pair_correction(c_pos[i], c_pos[j]) {
+            c_pos[i] -= corr;
+            c_pos[j] += corr;
+        }
+    }
+
+    /// Gauss-Seidel sweep over occupied cells (forward half-stencil, each
+    /// unordered cell pair once). Fastest engine at serial particle counts.
+    fn resolve_collisions_serial(&mut self, c_pos: &mut [Vec2]) {
+        for oc in 0..self.grid.occupied.len() {
+            let cell = self.grid.occupied[oc] as usize;
+            let (x, y) = (cell % GRID_W, cell / GRID_W);
+            let currents = self.grid.cell(cell);
+
+            for a in 0..currents.len() {
+                let i = currents[a] as usize;
+                for b in a + 1..currents.len() {
+                    Self::project_pair(c_pos, i, currents[b] as usize);
+                }
+            }
+
+            for (dx, dy) in [(1i32, 0i32), (-1, 1), (0, 1), (1, 1)] {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                if nx < 0 || nx >= GRID_W as i32 || ny >= GRID_H as i32 {
+                    continue;
+                }
+                for &i in currents {
+                    for &j in self.grid.cell(ny as usize * GRID_W + nx as usize) {
+                        Self::project_pair(c_pos, i as usize, j as usize);
+                    }
+                }
             }
         }
+    }
 
-        for y in 0..(Y_LEN) as usize {
-            for &i in self.table[y * X_LEN as usize + (X_LEN - 1.0) as usize].iter() {
-                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
+    fn check_wall_collisions_serial(&mut self, c_pos: &mut [Vec2]) {
+        for y in 0..GRID_H {
+            for &i in self.grid.cell(y * GRID_W) {
+                resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
+            }
+            for &i in self.grid.cell(y * GRID_W + (GRID_W - 1)) {
+                resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
             }
         }
-
-        for x in 0..(X_LEN) as usize {
-            for &i in self.table[x].iter() {
-                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
+        for x in 0..GRID_W {
+            for &i in self.grid.cell(x) {
+                resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
+            }
+            for &i in self.grid.cell((GRID_H - 1) * GRID_W + x) {
+                resolve_wall_collision(&mut c_pos[i as usize], &mut self.c_opos[i as usize]);
             }
         }
+    }
 
-        for x in 0..(X_LEN) as usize {
-            for &i in self.table[((Y_LEN - 1.0) * X_LEN) as usize + x].iter() {
-                resolve_wall_collision(&mut c_pos[i], &mut self.c_opos[i]);
-            }
+    /// One Jacobi iteration of contact projection on the packed arrays:
+    /// gather every particle's half-corrections (read-only, so trivially
+    /// parallel and vectorizable), then apply them in one sweep.
+    fn resolve_collisions_packed(&mut self) {
+        let n = self.px.len();
+        self.acc_x.clear();
+        self.acc_x.resize(n, 0.0);
+        self.acc_y.clear();
+        self.acc_y.resize(n, 0.0);
+
+        {
+            let (grid, px, py, cells) = (&self.grid, &self.px, &self.py, &self.packed_cell);
+            let (acc_x, acc_y) = (&mut self.acc_x, &mut self.acc_y);
+            acc_x
+                .par_iter_mut()
+                .zip(acc_y.par_iter_mut())
+                .enumerate()
+                .for_each(|(k, (cx, cy))| {
+                    let rows = stencil_rows(&grid.cell_start, cells[k] as usize);
+                    let (gx, gy) = gather_correction(px[k], py[k], px, py, &rows);
+                    *cx = gx;
+                    *cy = gy;
+                });
+        }
+
+        for k in 0..n {
+            self.px[k] += self.acc_x[k];
+            self.py[k] += self.acc_y[k];
+        }
+    }
+
+    fn check_wall_collisions_packed(&mut self) {
+        // Left and right border columns
+        for y in 0..GRID_H {
+            self.wall_cell(y * GRID_W);
+            self.wall_cell(y * GRID_W + (GRID_W - 1));
+        }
+
+        // Bottom and top border rows
+        for x in 0..GRID_W {
+            self.wall_cell(x);
+            self.wall_cell((GRID_H - 1) * GRID_W + x);
+        }
+    }
+
+    /// Wall-project the packed particles of one (border) cell. `c_opos` is
+    /// still indexed by particle id — the grid indices map back.
+    fn wall_cell(&mut self, cell: usize) {
+        let start = self.grid.cell_start[cell] as usize;
+        let end = self.grid.cell_start[cell + 1] as usize;
+        for k in start..end {
+            let mut pos = Vec2::new(self.px[k], self.py[k]);
+            let i = self.grid.indices[k] as usize;
+            resolve_wall_collision(&mut pos, &mut self.c_opos[i]);
+            self.px[k] = pos.x;
+            self.py[k] = pos.y;
         }
     }
 
@@ -620,19 +1170,15 @@ impl Physics {
 }
 
 #[inline(always)]
-fn ball_collides(pos_a: Vec2, scale_a: f32, pos_b: Vec2, scale_b: f32) -> bool {
-    (pos_a - pos_b).length_squared() < ((scale_a + scale_b) * (scale_a + scale_b))
-}
-
-#[inline(always)]
 fn force(pos_a: Vec2, pos_b: Vec2, scale: f32) -> Vec2 {
     let dir = pos_a - pos_b;
-    let dist = dir.length();
-    if dist < BALL_SIZE {
+    let dist_sq = dir.length_squared();
+    if dist_sq < BALL_SIZE * BALL_SIZE {
         return Vec2::ZERO;
     }
 
-    (dir.normalize() * scale) / (dist * dist).max(1.0)
+    // == normalize(dir) * scale / max(dist², 1), with one rsqrt total
+    dir * (scale * fast_rsqrt(dist_sq) / dist_sq.max(1.0))
 }
 
 enum Collision {

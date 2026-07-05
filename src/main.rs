@@ -1,6 +1,4 @@
-pub mod constants;
-pub mod physics;
-pub mod simd_physics;
+use lolballs::{constants, physics};
 
 use std::path;
 use std::sync::mpsc::{channel, Sender};
@@ -13,7 +11,7 @@ use ggez::graphics::{Color, DrawMode, DrawParam, Image, InstanceArray, Mesh, Tex
 
 use ggez::winit::event::VirtualKeyCode;
 use ggez::{event, graphics, Context, ContextBuilder, GameResult};
-use constants::{BALL_SIZE, HEIGHT, WIDTH, X_LEN, Y_LEN};
+use constants::{BALL_SIZE, HEIGHT, WIDTH};
 use physics::{EventToPthread, Physics, ShareData, PHYS_TIME_STEP};
 
 const BACKGROUND_COLOR: Color = Color::new(0., 0., 0., 0.0);
@@ -34,8 +32,6 @@ fn main() -> GameResult {
     std::thread::spawn(move || {
         let mut physics = Physics::new(
             Vec::with_capacity(15000),
-            Vec::with_capacity(15000),
-            vec![Vec::new(); ((X_LEN + 1.0) * (Y_LEN + 1.0)) as usize],
             Vec::with_capacity(15000),
             rx,
             2000.0,
