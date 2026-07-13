@@ -3,14 +3,21 @@
 A real-time particle water simulation built from techniques in the particle
 simulation literature, with every optimization measured before adoption.
 
-## The model
+## The model(s)
 
-Local pressure-like repulsion with compact support (cutoff = 2.5 particle
-radii, smoothly tapered to zero), position-based contact projection, and
-Størmer–Verlet integration at 480 Hz substeps — the standard shape of a
-particle water model (SPH/PBF family). O(n) per step via a counting-sort
-CSR grid whose cell size equals the interaction cutoff, making the one-cell
-stencil provably exact (`--validate` checks it against the O(n²) sum).
+Two selectable particle-fluid models (`--sim granular|pbf`, default granular):
+
+- **Granular** — local pressure-like repulsion with compact support (cutoff =
+  2.5 particle radii, smoothly tapered to zero), position-based contact
+  projection, and Størmer–Verlet integration at 480 Hz substeps. It stacks and
+  slumps like a pile of balls. O(n) per step via a counting-sort CSR grid whose
+  cell size equals the interaction cutoff, making the one-cell stencil provably
+  exact (`--validate` checks it against the O(n²) sum).
+- **PBF** — Position Based Fluids (Macklin & Müller, SIGGRAPH 2013): the same
+  position-projection solver enforces a *density* constraint instead of
+  non-penetration, so the particles pour, splash, and slosh as an
+  incompressible liquid. See [docs/pbf.md](docs/pbf.md) for the algorithm, the
+  side-by-side comparison renders, and the tuning notes.
 
 ## Optimization techniques (all measured; see docs/benchmarks)
 
@@ -28,6 +35,8 @@ stencil provably exact (`--validate` checks it against the O(n²) sum).
 - **W/S**: Increase/decrease force scale
 - **V**: Toggle Verlet neighbor lists
 - **A**: Toggle adaptive time-stepping
+
+Launch flag: `--sim granular` (default) or `--sim pbf` selects the fluid model.
 
 ## Performance
 

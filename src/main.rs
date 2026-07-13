@@ -12,11 +12,34 @@ use ggez::graphics::{Color, DrawMode, DrawParam, Image, InstanceArray, Mesh, Tex
 use constants::{BALL_SIZE, HEIGHT, WIDTH};
 use ggez::winit::event::VirtualKeyCode;
 use ggez::{event, graphics, Context, ContextBuilder, GameResult};
-use physics::{EventToPthread, Physics, ShareData, PHYS_TIME_STEP};
+use physics::{EventToPthread, Physics, ShareData, Strategy, PHYS_TIME_STEP};
 
 const BACKGROUND_COLOR: Color = Color::new(0., 0., 0., 0.0);
 
+/// Parse `--sim granular|pbf` (default granular) from the command line.
+fn parse_strategy() -> Strategy {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        let val = if let Some(v) = a.strip_prefix("--sim=") {
+            Some(v.to_string())
+        } else if a == "--sim" {
+            args.next()
+        } else {
+            None
+        };
+        if let Some(v) = val {
+            match Strategy::parse(&v) {
+                Some(s) => return s,
+                None => eprintln!("unknown --sim value '{v}', using granular"),
+            }
+        }
+    }
+    Strategy::Granular
+}
+
 fn main() -> GameResult {
+    let strategy = parse_strategy();
+    println!("fluid model: {strategy:?}  (switch with --sim granular|pbf)");
     let (mut ctx, events_loop) = ContextBuilder::new("ballz", "ggez")
         .window_setup(WindowSetup::default().vsync(false))
         .window_mode(WindowMode::default().dimensions(WIDTH, HEIGHT))
@@ -36,6 +59,7 @@ fn main() -> GameResult {
             rx,
             2000.0,
         );
+        physics.set_strategy(strategy);
 
         let clock = std::time::Instant::now();
         let mut phys_frame_start = clock.elapsed().as_secs_f32();
