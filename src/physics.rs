@@ -77,13 +77,13 @@ const SOLVER_ITERATIONS: usize = 3;
 const SOLVER_OMEGA: f32 = 1.0;
 
 // Below this particle count the serial grid paths win (rayon region overhead
-// dominates small workloads). Originally 16k (docs/benchmarks/10); re-swept
-// after MTS + 3 iterations + smaller particles changed the packed engine's
-// cost profile (docs/benchmarks/18-engine-crossover.md): packed now wins at
-// ~16-20k on spatial-hash but only ~24k on verlet-lists, margins within the
-// VM noise band, so the single threshold sits between. Runtime-tunable via
-// `set_par_min_particles`.
-const PAR_MIN_PARTICLES: usize = 22_000;
+// dominates small workloads). Re-swept after every change to the packed
+// engine's cost profile: 16k originally (stage 10), 22k after MTS + smaller
+// particles (stage 18), back down to 14k once the clustered solver gather
+// (stage 23) and the cutoff model (stage 25) made the packed engine cheaper
+// — it now wins clearly from 16k on both paths and ties at 12k (stage 26).
+// Runtime-tunable via `set_par_min_particles`.
+const PAR_MIN_PARTICLES: usize = 14_000;
 
 const LEFT_WALL: f32 = 0.;
 const RIGHT_WALL: f32 = WIDTH;
@@ -191,16 +191,33 @@ impl CsrGrid {
         (y * GRID_W + x) as u32
     }
 
-    fn build(&mut self, positions: &[Vec2]) {
+    fn build(&mut self, positions: &[Vec2], parallel: bool) {
         let n = positions.len();
         self.cell_of.resize(n, 0);
         self.indices.resize(n, 0);
         self.cursor.fill(0);
 
-        for (i, p) in positions.iter().enumerate() {
-            let c = Self::cell_id(*p);
-            self.cell_of[i] = c;
-            self.cursor[c as usize] += 1;
+        if parallel {
+            // The cell-id computation (fp math + conversions) is the
+            // expensive half of the counting pass and is embarrassingly
+            // parallel; the count itself stays serial (n random increments).
+            self.cell_of
+                .par_chunks_mut(4096)
+                .zip(positions.par_chunks(4096))
+                .for_each(|(cells, ps)| {
+                    for (c, p) in cells.iter_mut().zip(ps) {
+                        *c = Self::cell_id(*p);
+                    }
+                });
+            for &c in &self.cell_of {
+                self.cursor[c as usize] += 1;
+            }
+        } else {
+            for (i, p) in positions.iter().enumerate() {
+                let c = Self::cell_id(*p);
+                self.cell_of[i] = c;
+                self.cursor[c as usize] += 1;
+            }
         }
 
         let mut sum = 0u32;
@@ -556,7 +573,7 @@ impl Physics {
         // Build the CSR grid once per substep; forces and all solver
         // iterations reuse it (positions move a small fraction of a cell).
         let t = Instant::now();
-        self.grid.build(&share.c_pos);
+        self.grid.build(&share.c_pos, share.c_pos.len() >= self.par_min);
         share.perf_stats.neighbor_rebuild_time_us += t.elapsed().as_micros() as u64;
 
         if self.frame_count % REORDER_INTERVAL == 0 {
@@ -749,7 +766,7 @@ impl Physics {
     /// ≤ one cell, so the 3×3 neighborhood must contain every interacting
     /// pair — any discrepancy beyond summation-order rounding is a bug).
     pub fn forces_grid(&mut self, positions: &[Vec2]) -> Vec<Vec2> {
-        self.grid.build(positions);
+        self.grid.build(positions, false);
         let (grid, scale) = (&self.grid, self.scale);
         positions
             .iter()
@@ -896,12 +913,13 @@ impl Physics {
     fn compute_forces_with_spatial_hash(&mut self, c_pos: &[Vec2]) {
         let n = c_pos.len();
         if n >= self.par_min {
-            // Packed parallel gather over the CSR-ordered SoA arrays.
+            // Packed parallel gather over the CSR-ordered SoA arrays. The
+            // gather writes every element, so the buffers need sizing only.
             let s8 = self.scale / 8.0;
-            self.acc_x.clear();
-            self.acc_x.resize(n, 0.0);
-            self.acc_y.clear();
-            self.acc_y.resize(n, 0.0);
+            if self.acc_x.len() != n {
+                self.acc_x.resize(n, 0.0);
+                self.acc_y.resize(n, 0.0);
+            }
 
             {
                 let (grid, px, py, cells) = (&self.grid, &self.px, &self.py, &self.packed_cell);
@@ -1043,18 +1061,24 @@ impl Physics {
 
     /// One Jacobi iteration of contact projection on the packed arrays:
     /// gather every particle's half-corrections (read-only, so trivially
-    /// parallel and vectorizable), then apply them in one sweep. Gathers run
-    /// per *cluster* of 4 consecutive packed particles: packed order is cell
-    /// order, so a cluster usually sits on one grid row and shares a union
-    /// stencil — each candidate is then loaded once against 4 full SIMD
-    /// lanes instead of 4 times against ~1-wide rows (stage 23). Clusters
-    /// that straddle a grid row (or the tail) fall back to the scalar path.
+    /// parallel and vectorizable). Gathers run per *cluster* of 4
+    /// consecutive packed particles: packed order is cell order, so a
+    /// cluster usually sits on one grid row and shares a union stencil —
+    /// each candidate is then loaded once against 4 full SIMD lanes instead
+    /// of 4 times against ~1-wide rows (stage 23). Clusters that straddle a
+    /// grid row (or the tail) fall back to the scalar path.
+    ///
+    /// Double-buffered (stage 26): the gather writes the *corrected
+    /// positions* into acc_x/acc_y directly and the buffers are swapped in,
+    /// replacing the old accumulate-then-serial-apply pass. Bit-identical
+    /// results, three fewer serial sweeps per substep. The buffers are
+    /// fully overwritten, so no zeroing either.
     fn resolve_collisions_packed(&mut self) {
         let n = self.px.len();
-        self.acc_x.clear();
-        self.acc_x.resize(n, 0.0);
-        self.acc_y.clear();
-        self.acc_y.resize(n, 0.0);
+        if self.acc_x.len() != n {
+            self.acc_x.resize(n, 0.0);
+            self.acc_y.resize(n, 0.0);
+        }
 
         {
             let relax = 0.375 * self.solver_omega;
@@ -1079,25 +1103,26 @@ impl Physics {
                         let xs = [px[k0], px[k0 + 1], px[k0 + 2], px[k0 + 3]];
                         let ys = [py[k0], py[k0 + 1], py[k0 + 2], py[k0 + 3]];
                         let (gx, gy) = gather_correction4(&xs, &ys, px, py, &rows, relax);
-                        ax.copy_from_slice(&gx);
-                        ay.copy_from_slice(&gy);
+                        for l in 0..4 {
+                            ax[l] = xs[l] + gx[l];
+                            ay[l] = ys[l] + gy[l];
+                        }
                     } else {
                         for l in 0..m {
                             let rows =
                                 stencil_rows(&grid.cell_start, cells[k0 + l] as usize);
                             let (gx, gy) =
                                 gather_correction(px[k0 + l], py[k0 + l], px, py, &rows, relax);
-                            ax[l] = gx;
-                            ay[l] = gy;
+                            ax[l] = px[k0 + l] + gx;
+                            ay[l] = py[k0 + l] + gy;
                         }
                     }
                 });
         }
 
-        for k in 0..n {
-            self.px[k] += self.acc_x[k];
-            self.py[k] += self.acc_y[k];
-        }
+        // The corrected positions are the new packed state.
+        std::mem::swap(&mut self.px, &mut self.acc_x);
+        std::mem::swap(&mut self.py, &mut self.acc_y);
     }
 
     fn check_wall_collisions_packed(&mut self) {
