@@ -1,8 +1,27 @@
-# Benchmark series — 2026-07-01 optimization pass
+# Benchmark series
 
-Every optimization in this pass was measured before and after with the same
-harness; nothing was assumed. One file per stage, numbered in the order the
-changes landed (each stage includes all previous ones):
+Every optimization is measured before and after with the same harness;
+nothing is assumed. One file per stage, numbered in the order the changes
+landed (each stage includes all previous ones).
+
+## Second pass — 2026-07-13 (algorithmic accuracy/speed trades)
+
+Final report with baseline→final tables:
+[16-second-pass-report.md](16-second-pass-report.md).
+
+| # | file | change | headline effect |
+|---|---|---|---|
+| 12 | [12-baseline-2026-07-13.md](12-baseline-2026-07-13.md) | none (fresh baseline of stage-11 code) | BH path: forces 75–82 % of step; grid paths: solver 60–73 % |
+| 13 | [13-bh-theta.md](13-bh-theta.md) | BH force-**sign fix** (attraction → repulsion, bug since BH introduction) + measured θ, default 0.5 → 0.9 | 2.2× cheaper traversal at 6 % measured force error |
+| 14 | [14-mts-farfield.md](14-mts-farfield.md) | multiple time stepping (r-RESPA): far field every 4 substeps, contacts every substep | −55…−66 % BH-path step; −17…−28 % grid paths; contact quality unchanged |
+| 15 | [15-solver-relaxation.md](15-solver-relaxation.md) | solver iterations 4 → 3, SOR ω measured on both engines | −18/−32 % solver time at reference quality; ω ≥ 1.5 unsafe on Jacobi engine |
+
+Net (mean µs/step, defaults, same-day A/B): BH path 2.5–4.2× faster and
+real-time through **12 000** particles (was 3 000); grid paths ~1.4× faster
+at solver-dominated sizes. New harness modes: `--force-error`, `--sweep`
+(quality metrics + chaos-floor control), `--soak`.
+
+## First pass — 2026-07-01 (data structures & parallelism)
 
 | # | file | change | headline effect |
 |---|---|---|---|

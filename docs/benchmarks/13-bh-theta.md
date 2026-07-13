@@ -60,7 +60,11 @@ the bounded box keeps far-field contributions from averaging out as cleanly.
 ## Decision
 
 Default θ raised 0.5 → **0.9**: ≈ 2.2× cheaper traversal for ~6 % force
-error on a force whose job here is visual (spreading pressure), and whose
-end-to-end effect is indistinguishable from the chaos floor in the stage-14
-drift measurements. θ stays runtime-tunable (`set_bh_theta`) — anything
-needing the old accuracy sets 0.5 back and pays the old price.
+error on a force whose job here is visual (spreading pressure). End-to-end
+(stage-14 sweep): contact quality is unchanged at θ=0.9 (deep pairs 0, mean
+pen within noise of reference), and its density drift sits on the same
+~10–15 % trajectory-decorrelation plateau as the most conservative variant
+measured (θ=0.7, K=1) — i.e. no measurable systematic damage beyond "a
+different but equally valid trajectory" of this chaotic system. θ stays
+runtime-tunable (`set_bh_theta`) — anything needing the old accuracy sets
+0.5 back and pays the old price.
