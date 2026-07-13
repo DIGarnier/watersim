@@ -249,7 +249,11 @@ fn run_opts(
     }
 
     // Sanity checks: the optimizations must not blow up the simulation.
-    let nan_count = share.c_pos.iter().filter(|p| !p.x.is_finite() || !p.y.is_finite()).count();
+    let nan_count = share
+        .c_pos
+        .iter()
+        .filter(|p| !p.x.is_finite() || !p.y.is_finite())
+        .count();
     let escaped_count = share
         .c_pos
         .iter()
@@ -315,7 +319,11 @@ fn validate_mode() {
             "| {} | {:.2e} | {} |",
             n,
             rel,
-            if rel < 1e-5 { "exact (fp noise)" } else { "MISMATCH" }
+            if rel < 1e-5 {
+                "exact (fp noise)"
+            } else {
+                "MISMATCH"
+            }
         );
     }
 }
@@ -329,10 +337,40 @@ fn small_steps_mode() {
     const WARMUP: usize = 480;
     let variants: &[(&str, Knobs)] = &[
         ("S=1 it=3 (adopted)", ADOPTED_KNOBS),
-        ("S=1 it=1 (iteration cut only)", Knobs { iters: 1, ..ADOPTED_KNOBS }),
-        ("S=2 it=1 K=8", Knobs { substeps: 2, iters: 1, fint: 8, ..ADOPTED_KNOBS }),
-        ("S=2 it=2 K=8", Knobs { substeps: 2, iters: 2, fint: 8, ..ADOPTED_KNOBS }),
-        ("S=3 it=1 K=12", Knobs { substeps: 3, iters: 1, fint: 12, ..ADOPTED_KNOBS }),
+        (
+            "S=1 it=1 (iteration cut only)",
+            Knobs {
+                iters: 1,
+                ..ADOPTED_KNOBS
+            },
+        ),
+        (
+            "S=2 it=1 K=8",
+            Knobs {
+                substeps: 2,
+                iters: 1,
+                fint: 8,
+                ..ADOPTED_KNOBS
+            },
+        ),
+        (
+            "S=2 it=2 K=8",
+            Knobs {
+                substeps: 2,
+                iters: 2,
+                fint: 8,
+                ..ADOPTED_KNOBS
+            },
+        ),
+        (
+            "S=3 it=1 K=12",
+            Knobs {
+                substeps: 3,
+                iters: 1,
+                fint: 12,
+                ..ADOPTED_KNOBS
+            },
+        ),
     ];
     let configs: &[(usize, ForcePath)] = &[
         (12_000, ForcePath::VerletLists),
@@ -343,7 +381,15 @@ fn small_steps_mode() {
     println!("|---|---|---|---|---|---|---|---|---|---|---|");
     for &(n, path) in configs {
         let run = |knobs: Knobs| {
-            run_opts(n, STEPS, WARMUP, path, Some(ADOPTED_KNOBS), Some(knobs), false)
+            run_opts(
+                n,
+                STEPS,
+                WARMUP,
+                path,
+                Some(ADOPTED_KNOBS),
+                Some(knobs),
+                false,
+            )
         };
         let reference = run(ADOPTED_KNOBS);
         for &(label, knobs) in variants {
@@ -386,7 +432,10 @@ fn engine_sweep_mode() {
                     150,
                     30,
                     path,
-                    Some(Knobs { par_min: Some(pm), ..ADOPTED_KNOBS }),
+                    Some(Knobs {
+                        par_min: Some(pm),
+                        ..ADOPTED_KNOBS
+                    }),
                 )
             };
             let serial = run(usize::MAX);
@@ -397,7 +446,11 @@ fn engine_sweep_mode() {
                 path.label(),
                 serial.mean_us,
                 packed.mean_us,
-                if packed.mean_us < serial.mean_us { "yes" } else { "no" },
+                if packed.mean_us < serial.mean_us {
+                    "yes"
+                } else {
+                    "no"
+                },
             );
         }
     }
@@ -408,7 +461,9 @@ fn engine_sweep_mode() {
 /// degradation modes (creeping penetration, drift into walls, NaN) that the
 /// short timing windows can't see.
 fn soak_mode() {
-    println!("| particles | path | steps | mean µs | max pen % | mean pen % | deep pairs | sane? |");
+    println!(
+        "| particles | path | steps | mean µs | max pen % | mean pen % | deep pairs | sane? |"
+    );
     println!("|---|---|---|---|---|---|---|---|");
     for &(n, path) in &[
         (12_000usize, ForcePath::VerletLists),
@@ -440,26 +495,82 @@ fn soak_mode() {
 /// worst penetration, and end-state density drift.
 fn sweep_mode() {
     const STEPS: usize = 240; // 0.5 s of simulated time, measured
-    // Settle 1 s under identical reference physics before switching knobs,
-    // so variants are compared from the same near-equilibrium state instead
-    // of mid-collapse (where chaotic divergence swamps systematic error).
+                              // Settle 1 s under identical reference physics before switching knobs,
+                              // so variants are compared from the same near-equilibrium state instead
+                              // of mid-collapse (where chaotic divergence swamps systematic error).
     const WARMUP: usize = 480;
 
     let grid_variants: &[(&str, Knobs)] = &[
-        ("K=4", Knobs { fint: 4, ..REF_KNOBS }),
-        ("it=3 ω=1.0", Knobs { iters: 3, ..REF_KNOBS }),
-        ("it=2 ω=1.0", Knobs { iters: 2, ..REF_KNOBS }),
-        ("it=2 ω=1.25", Knobs { iters: 2, omega: 1.25, ..REF_KNOBS }),
-        ("it=2 ω=1.5", Knobs { iters: 2, omega: 1.5, ..REF_KNOBS }),
-        ("it=1 ω=1.5", Knobs { iters: 1, omega: 1.5, ..REF_KNOBS }),
-        ("it=1 ω=2.0", Knobs { iters: 1, omega: 2.0, ..REF_KNOBS }),
+        (
+            "K=4",
+            Knobs {
+                fint: 4,
+                ..REF_KNOBS
+            },
+        ),
+        (
+            "it=3 ω=1.0",
+            Knobs {
+                iters: 3,
+                ..REF_KNOBS
+            },
+        ),
+        (
+            "it=2 ω=1.0",
+            Knobs {
+                iters: 2,
+                ..REF_KNOBS
+            },
+        ),
+        (
+            "it=2 ω=1.25",
+            Knobs {
+                iters: 2,
+                omega: 1.25,
+                ..REF_KNOBS
+            },
+        ),
+        (
+            "it=2 ω=1.5",
+            Knobs {
+                iters: 2,
+                omega: 1.5,
+                ..REF_KNOBS
+            },
+        ),
+        (
+            "it=1 ω=1.5",
+            Knobs {
+                iters: 1,
+                omega: 1.5,
+                ..REF_KNOBS
+            },
+        ),
+        (
+            "it=1 ω=2.0",
+            Knobs {
+                iters: 1,
+                omega: 2.0,
+                ..REF_KNOBS
+            },
+        ),
         (
             "combo-safe K=4 it=3 ω=1.0",
-            Knobs { fint: 4, iters: 3, omega: 1.0, ..REF_KNOBS },
+            Knobs {
+                fint: 4,
+                iters: 3,
+                omega: 1.0,
+                ..REF_KNOBS
+            },
         ),
         (
             "combo-fast K=4 it=2 ω=1.25",
-            Knobs { fint: 4, iters: 2, omega: 1.25, ..REF_KNOBS },
+            Knobs {
+                fint: 4,
+                iters: 2,
+                omega: 1.25,
+                ..REF_KNOBS
+            },
         ),
     ];
 
@@ -480,7 +591,15 @@ fn sweep_mode() {
     println!("|---|---|---|---|---|---|---|---|---|---|---|---|");
     for &(n, path, variants) in configs {
         let run = |knobs: Knobs, perturb: bool| {
-            run_opts(n, STEPS, WARMUP, path, Some(REF_KNOBS), Some(knobs), perturb)
+            run_opts(
+                n,
+                STEPS,
+                WARMUP,
+                path,
+                Some(REF_KNOBS),
+                Some(knobs),
+                perturb,
+            )
         };
         let reference = run(REF_KNOBS, false);
         let print_row = |label: &str, r: &RunResult| {
@@ -556,7 +675,13 @@ fn main() {
                 let p = r.phase_means_us;
                 println!(
                     "| {} | {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} |",
-                    particles, path.label(), p[0], p[1], p[2], p[3], r.mean_us,
+                    particles,
+                    path.label(),
+                    p[0],
+                    p[1],
+                    p[2],
+                    p[3],
+                    r.mean_us,
                 );
             }
         }
@@ -565,7 +690,13 @@ fn main() {
     let configs: &[(usize, usize)] = if quick {
         &[(1_000, 120), (6_000, 40)]
     } else {
-        &[(1_000, 300), (3_000, 200), (6_000, 120), (12_000, 60), (24_000, 40)]
+        &[
+            (1_000, 300),
+            (3_000, 200),
+            (6_000, 120),
+            (12_000, 60),
+            (24_000, 40),
+        ]
     };
 
     println!("| particles | force path | steps | mean µs/step | median | p95 | min | max | 480 Hz real-time? | max pen % | sane? |");
@@ -574,7 +705,11 @@ fn main() {
     for &(particles, steps) in configs {
         for path in [ForcePath::VerletLists, ForcePath::SpatialHash] {
             let r = run_config(particles, steps, steps / 10 + 5, path, None);
-            let realtime = if r.median_us <= REALTIME_BUDGET_US { "yes" } else { "NO" };
+            let realtime = if r.median_us <= REALTIME_BUDGET_US {
+                "yes"
+            } else {
+                "NO"
+            };
             let sane = if r.nan_count == 0 && r.escaped_count == 0 {
                 "ok".to_string()
             } else {
@@ -582,9 +717,17 @@ fn main() {
             };
             println!(
                 "| {} | {} | {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {} | {:.1} | {} |",
-                r.particles, r.path.label(), r.steps,
-                r.mean_us, r.median_us, r.p95_us, r.min_us, r.max_us,
-                realtime, r.quality.max_pen_pct, sane,
+                r.particles,
+                r.path.label(),
+                r.steps,
+                r.mean_us,
+                r.median_us,
+                r.p95_us,
+                r.min_us,
+                r.max_us,
+                realtime,
+                r.quality.max_pen_pct,
+                sane,
             );
         }
     }

@@ -9,9 +9,9 @@ use ggez::event::MouseButton;
 use ggez::glam::Vec2;
 use ggez::graphics::{Color, DrawMode, DrawParam, Image, InstanceArray, Mesh, Text};
 
+use constants::{BALL_SIZE, HEIGHT, WIDTH};
 use ggez::winit::event::VirtualKeyCode;
 use ggez::{event, graphics, Context, ContextBuilder, GameResult};
-use constants::{BALL_SIZE, HEIGHT, WIDTH};
 use physics::{EventToPthread, Physics, ShareData, PHYS_TIME_STEP};
 
 const BACKGROUND_COLOR: Color = Color::new(0., 0., 0., 0.0);
@@ -255,8 +255,16 @@ impl event::EventHandler<ggez::GameError> for MainState {
             Controls:\n\
             [W/S] Adjust force scale\n\
             Mouse drag: Add particles",
-            if perf_stats.verlet_lists_enabled { "ON" } else { "OFF" },
-            if perf_stats.adaptive_dt_enabled { "ON" } else { "OFF" },
+            if perf_stats.verlet_lists_enabled {
+                "ON"
+            } else {
+                "OFF"
+            },
+            if perf_stats.adaptive_dt_enabled {
+                "ON"
+            } else {
+                "OFF"
+            },
             perf_stats.integration_time_us,
             perf_stats.collision_time_us,
             perf_stats.current_dt,

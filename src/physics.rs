@@ -36,10 +36,10 @@ fn taper(dist_sq: f32) -> f32 {
 
 // Optimization constants
 const VERLET_SKIN_DISTANCE: f32 = BALL_SIZE * 0.5; // Extra distance for neighbor lists
-// When neighbor lists have gone stale (something moved > skin/2), forces fall
-// back to the direct cell pass — which costs the same as the rebuild gather —
-// and a rebuild is only re-attempted this often, in case the system calmed
-// down enough for lists to stay valid again ("lazy Verlet").
+                                                   // When neighbor lists have gone stale (something moved > skin/2), forces fall
+                                                   // back to the direct cell pass — which costs the same as the rebuild gather —
+                                                   // and a rebuild is only re-attempted this often, in case the system calmed
+                                                   // down enough for lists to stay valid again ("lazy Verlet").
 const VERLET_REBUILD_RETRY: usize = 16;
 
 // Physically permute the particle arrays into grid (spatial) order this often.
@@ -573,7 +573,8 @@ impl Physics {
         // Build the CSR grid once per substep; forces and all solver
         // iterations reuse it (positions move a small fraction of a cell).
         let t = Instant::now();
-        self.grid.build(&share.c_pos, share.c_pos.len() >= self.par_min);
+        self.grid
+            .build(&share.c_pos, share.c_pos.len() >= self.par_min);
         share.perf_stats.neighbor_rebuild_time_us += t.elapsed().as_micros() as u64;
 
         if self.frame_count % REORDER_INTERVAL == 0 {
@@ -851,8 +852,8 @@ impl Physics {
         // 2·BALL + skin over 3×3, which silently truncated list-mode forces
         // relative to the direct pass; with the stage-25 explicit cutoff the
         // two modes now compute the same interaction set.)
-        let interaction_range_sq = (FORCE_CUTOFF + VERLET_SKIN_DISTANCE)
-            * (FORCE_CUTOFF + VERLET_SKIN_DISTANCE);
+        let interaction_range_sq =
+            (FORCE_CUTOFF + VERLET_SKIN_DISTANCE) * (FORCE_CUTOFF + VERLET_SKIN_DISTANCE);
         for i in 0..c_pos.len() {
             lists.start[i] = lists.neighbors.len() as u32;
 
@@ -1109,8 +1110,7 @@ impl Physics {
                         }
                     } else {
                         for l in 0..m {
-                            let rows =
-                                stencil_rows(&grid.cell_start, cells[k0 + l] as usize);
+                            let rows = stencil_rows(&grid.cell_start, cells[k0 + l] as usize);
                             let (gx, gy) =
                                 gather_correction(px[k0 + l], py[k0 + l], px, py, &rows, relax);
                             ax[l] = px[k0 + l] + gx;
@@ -1161,12 +1161,18 @@ impl Physics {
 
     pub fn toggle_verlet_lists(&mut self) {
         self.use_verlet_lists = !self.use_verlet_lists;
-        println!("Verlet Lists: {}", if self.use_verlet_lists { "ON" } else { "OFF" });
+        println!(
+            "Verlet Lists: {}",
+            if self.use_verlet_lists { "ON" } else { "OFF" }
+        );
     }
 
     pub fn toggle_adaptive_dt(&mut self) {
         self.use_adaptive_dt = !self.use_adaptive_dt;
-        println!("Adaptive dt: {}", if self.use_adaptive_dt { "ON" } else { "OFF" });
+        println!(
+            "Adaptive dt: {}",
+            if self.use_adaptive_dt { "ON" } else { "OFF" }
+        );
     }
 
     fn cannon(
