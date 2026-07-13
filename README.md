@@ -1,25 +1,31 @@
 # watersim
 
-An n-body particle physics simulation with state-of-the-art optimization techniques.
+A real-time particle water simulation built from techniques in the particle
+simulation literature, with every optimization measured before adoption.
 
-## Features
+## The model
 
-This simulation implements multiple cutting-edge optimization techniques from the computational physics literature:
+Local pressure-like repulsion with compact support (cutoff = 2.5 particle
+radii, smoothly tapered to zero), position-based contact projection, and
+Størmer–Verlet integration at 480 Hz substeps — the standard shape of a
+particle water model (SPH/PBF family). O(n) per step via a counting-sort
+CSR grid whose cell size equals the interaction cutoff, making the one-cell
+stencil provably exact (`--validate` checks it against the O(n²) sum).
 
-- **Barnes-Hut Quadtree** - Hierarchical force approximation (O(n log n))
-- **Verlet Neighbor Lists** - Cached neighbor lists to reduce redundant calculations
-- **Adaptive Time-Stepping** - Dynamic timestep adjustment for stability
-- **SIMD Vectorization** - Structure-of-Arrays layout for better performance
-- **GPU Compute Shaders** - WGSL compute shaders for GPU-accelerated physics
-- **Spatial Hashing** - Grid-based collision detection
+## Optimization techniques (all measured; see docs/benchmarks)
 
-All optimizations can be toggled at runtime to demonstrate their effectiveness!
+- **CSR counting-sort grid** - one flat index array, built once per substep
+- **Verlet neighbor lists** - displacement-triggered lazy rebuilds
+- **Multiple time stepping (r-RESPA)** - smooth forces refreshed every 4th substep
+- **Two solver engines** - serial Gauss-Seidel; packed SoA Jacobi with clustered SIMD gathers at scale
+- **Small Steps substepping** - runtime knob (Macklin et al. 2019)
+- **Rayon parallelism, SFC particle reordering, hardware rsqrt kernels**
+- **Adaptive time-stepping** - dynamic timestep adjustment for stability
 
 ## Controls
 
 - **Mouse drag**: Add particles (cannon)
 - **W/S**: Increase/decrease force scale
-- **B**: Toggle Barnes-Hut algorithm
 - **V**: Toggle Verlet neighbor lists
 - **A**: Toggle adaptive time-stepping
 
@@ -62,10 +68,10 @@ cargo bench --no-default-features --bench nbody -- --quick
 ## References
 
 Based on research from:
-- Barnes & Hut (1986): hierarchical force approximation
+- Müller et al. (2003) / Macklin & Müller (2013) / Clavet et al. (2005): local particle water models
 - Verlet (1967): neighbor lists for molecular dynamics
 - Green (2010) / Hoetzlein (2014): counting-sort uniform grids (CSR layout)
-- Burtscher & Pingali (2011): allocation-free flat treecodes
-- Macklin et al. (2019): "Small Steps in Physics Simulation"
+- Tuckerman, Berne & Martyna (1992): r-RESPA multiple time stepping
+- Macklin et al. (2014, 2019): constraint relaxation; "Small Steps in Physics Simulation"
 
 Full annotated bibliography with links: [docs/literature.md](docs/literature.md).

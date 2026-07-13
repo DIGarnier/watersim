@@ -1,8 +1,46 @@
-# Benchmark series — 2026-07-01 optimization pass
+# Benchmark series
 
-Every optimization in this pass was measured before and after with the same
-harness; nothing was assumed. One file per stage, numbered in the order the
-changes landed (each stage includes all previous ones):
+Every optimization is measured before and after with the same harness;
+nothing is assumed. One file per stage, numbered in the order the changes
+landed (each stage includes all previous ones).
+
+## Second pass — 2026-07-13 (algorithmic accuracy/speed trades)
+
+Final report with baseline→final tables:
+[16-second-pass-report.md](16-second-pass-report.md).
+
+| # | file | change | headline effect |
+|---|---|---|---|
+| 12 | [12-baseline-2026-07-13.md](12-baseline-2026-07-13.md) | none (fresh baseline of stage-11 code) | BH path: forces 75–82 % of step; grid paths: solver 60–73 % |
+| 13 | [13-bh-theta.md](13-bh-theta.md) | BH force-**sign fix** (attraction → repulsion, bug since BH introduction) + measured θ, default 0.5 → 0.9 | 2.2× cheaper traversal at 6 % measured force error |
+| 14 | [14-mts-farfield.md](14-mts-farfield.md) | multiple time stepping (r-RESPA): far field every 4 substeps, contacts every substep | −55…−66 % BH-path step; −17…−28 % grid paths; contact quality unchanged |
+| 15 | [15-solver-relaxation.md](15-solver-relaxation.md) | solver iterations 4 → 3, SOR ω measured on both engines | −18/−32 % solver time at reference quality; ω ≥ 1.5 unsafe on Jacobi engine |
+| 16 | [16-second-pass-report.md](16-second-pass-report.md) | — (report for stages 12–15) | BH path 2.5–4.2×, real-time through 12k (was 3k) |
+| 17 | [17-smaller-particles.md](17-smaller-particles.md) | smaller particulates: BALL_SIZE 4 → 3 | 24k scenario no longer over-fills: max pen 100 % → 0–0.5 % on grid paths; mid sizes −15…−35 % pending stage 19 |
+| 18 | [18-engine-crossover.md](18-engine-crossover.md) | re-swept serial↔packed solver threshold | PAR_MIN_PARTICLES 16k → 22k (crossover moved with the new cost profile) |
+| 19 | [19-grid-retune.md](19-grid-retune.md) | grid cell 10 → 7.5 px (= contact + skin) | stencil candidates ×0.56: grid paths −25…−29 % at 12–24k |
+| 20 | [20-coincident-tiebreak.md](20-coincident-tiebreak.md) | tie-break for exactly-coincident pairs + wall-clamp anti-stacking salt | "glued pair" absorbing state removed; regression test added |
+| 21 | [21-dt2-integrator.md](21-dt2-integrator.md) | integrator fix: a·dt → a·dt² (impulse → acceleration) | behavior-preserving at 480 Hz; dynamics now dt-consistent (enables 22) |
+| 22 | [22-small-steps.md](22-small-steps.md) | proper Small Steps: S substeps × fewer iterations (`set_substeps`) | BH path: S=2×it=1 is −12 % **and** better contacts; grid paths prefer iterations — defaults unchanged |
+| 23 | [23-cluster-gather.md](23-cluster-gather.md) | i-cluster union-stencil gather for the packed solver (bit-exact) | packed solver phase −42 % at 24k; verlet 24k mean −29 % |
+| 24 | [24-cluster-force-gather-rejected.md](24-cluster-force-gather-rejected.md) | clustering the packed *force* gather (index-range masks) | **rejected**: ~15 % slower — kernel is FLOP-bound (no cutoff), no idle lanes to reclaim |
+| 25 | [25-cutoff-model.md](25-cutoff-model.md) | **model decision**: compact-support repulsion (cutoff 2.5 radii, C¹ taper); Barnes-Hut machinery + dead code removed | grid paths −10…−20 %; default mode 2.3–2.6× (was the BH path); max pen 0.0 % ≥ 3k; stencil validated exact vs O(n²) |
+| 26 | [26-unified-model-tuning.md](26-unified-model-tuning.md) | pass 3: crossover re-swept 22k→14k; packed solver double-buffered (no apply sweep); parallel grid-build cell-id pass | 24k packed engine −26 % verlet / −12 % spatial; contact quality unchanged |
+
+Net (mean µs/step, defaults, same-day A/B chains): BH path 2.5–4.2× faster;
+grid paths ~1.4× at solver-dominated sizes, another ~1.3× from stages
+17+19, and the packed engine another 1.15–1.4× from stage 23 — 24k
+end-state: verlet 1276 µs, spatial 1467 µs, BH 2916 µs mean. **Every path
+holds the 480 Hz median budget through 24 000 particles** (at pass start: no
+path at 24k, BH fell off at 6k; BH at 24k is median-real-time — its MTS
+refresh spikes amortize across the frame). Stages 20–21 are correctness
+work the instruments demanded: coincident pairs can't stay glued, and the
+integrator is dimensionally sound (a·dt²), which stage 22 turns into a
+measured Small-Steps quality/speed dial. New harness modes: `--force-error`,
+`--sweep` (quality metrics + chaos-floor control), `--engine-sweep`,
+`--small-steps`, `--soak`.
+
+## First pass — 2026-07-01 (data structures & parallelism)
 
 | # | file | change | headline effect |
 |---|---|---|---|
