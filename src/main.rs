@@ -56,7 +56,6 @@ fn main() -> GameResult {
                         Scale(scale) => {
                             physics.scale += scale;
                         }
-                        ToggleBarnesHut => physics.toggle_barnes_hut(),
                         ToggleVerletLists => physics.toggle_verlet_lists(),
                         ToggleAdaptiveDt => physics.toggle_adaptive_dt(),
                     }
@@ -170,7 +169,6 @@ impl event::EventHandler<ggez::GameError> for MainState {
             Some(VirtualKeyCode::W) => self.tx.send(EventToPthread::Scale(SCALER)).unwrap(),
             Some(VirtualKeyCode::S) => self.tx.send(EventToPthread::Scale(-SCALER)).unwrap(),
             // Toggle optimization techniques
-            Some(VirtualKeyCode::B) => self.tx.send(EventToPthread::ToggleBarnesHut).unwrap(),
             Some(VirtualKeyCode::V) => self.tx.send(EventToPthread::ToggleVerletLists).unwrap(),
             Some(VirtualKeyCode::A) => self.tx.send(EventToPthread::ToggleAdaptiveDt).unwrap(),
             _ => (),
@@ -246,7 +244,6 @@ impl event::EventHandler<ggez::GameError> for MainState {
             "FPS: {fps} | Particles: {nb_obj}\n\
             \n\
             Optimizations:\n\
-            [B] Barnes-Hut: {}\n\
             [V] Verlet Lists: {}\n\
             [A] Adaptive dt: {}\n\
             \n\
@@ -258,7 +255,6 @@ impl event::EventHandler<ggez::GameError> for MainState {
             Controls:\n\
             [W/S] Adjust force scale\n\
             Mouse drag: Add particles",
-            if perf_stats.barnes_hut_enabled { "ON" } else { "OFF" },
             if perf_stats.verlet_lists_enabled { "ON" } else { "OFF" },
             if perf_stats.adaptive_dt_enabled { "ON" } else { "OFF" },
             perf_stats.integration_time_us,

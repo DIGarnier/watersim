@@ -157,6 +157,31 @@ where fewer, stronger iterations buy solver time at equal penetration
 quality — the solver dominates the grid paths, so this converts directly to
 step time.
 
+## 9. Compact support: water forces are local (the stage-25 model decision)
+
+Every particle water method gives its interaction kernels compact support —
+pressure in a liquid is a local phenomenon:
+
+- Müller, Charypar & Gross, *Particle-Based Fluid Simulation for Interactive
+  Applications*, SCA 2003 — SPH smoothing kernels with support radius h,
+  identically zero beyond it.
+- Macklin & Müller, *Position Based Fluids*, SIGGRAPH 2013 — density
+  constraints over an h-neighborhood, found with a uniform grid of cell
+  size h.
+- Clavet, Beaudoin & Poulin, *Particle-based Viscoelastic Fluid Simulation*,
+  SCA 2005 — the classic realtime 2D water recipe: short-range
+  double-density relaxation, nothing long-range.
+
+**Applies here:** the sim historically ran a *split* model — the Barnes-Hut
+path summed 1/r² repulsion globally (an inverted-gravity n-body, needing an
+O(n log n) tree) while the grid paths truncated the same kernel at stencil
+geometry (an accidental, anisotropic cutoff). Stage 25 commits to the local
+model: explicit cutoff at 2.5 ball radii = one grid cell (making the 3×3
+stencil provably exact — validated against the O(n²) sum by the bench's
+`--validate` mode), with a smoothstep taper from the contact distance so
+the force is C¹ at the cutoff (no popping). The Barnes-Hut machinery,
+having no system left to approximate, was removed.
+
 ## Sources
 
 - https://arxiv.org/pdf/2212.07679

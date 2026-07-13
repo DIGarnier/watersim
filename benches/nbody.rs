@@ -14,9 +14,7 @@ use lolballs::physics::{Physics, ShareData, PHYS_TIME_STEP};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ForcePath {
-    /// Barnes-Hut quadtree forces (default configuration)
-    BarnesHut,
-    /// Verlet neighbor lists over the spatial hash
+    /// Verlet neighbor lists over the spatial hash (default configuration)
     VerletLists,
     /// Plain spatial-hash forces
     SpatialHash,
@@ -25,7 +23,6 @@ enum ForcePath {
 impl ForcePath {
     fn label(self) -> &'static str {
         match self {
-            ForcePath::BarnesHut => "barnes-hut",
             ForcePath::VerletLists => "verlet-lists",
             ForcePath::SpatialHash => "spatial-hash",
         }
@@ -37,18 +34,16 @@ impl ForcePath {
 /// explicitly so results don't shift when defaults are re-tuned.
 #[derive(Clone, Copy)]
 struct Knobs {
-    theta: f32,
-    fint: usize, // far-field force refresh interval (substeps)
+    fint: usize, // force refresh interval (substeps)
     iters: usize,
     omega: f32,
     par_min: Option<usize>, // None = engine default crossover
     substeps: usize,
 }
 
-/// The configuration this optimization pass started from (stage-11 behavior):
-/// θ = 0.5, forces recomputed every substep, 4 solver iterations at ω = 1.
+/// The knob values this optimization series started from (stage-11
+/// behavior): forces recomputed every substep, 4 solver iterations at ω = 1.
 const REF_KNOBS: Knobs = Knobs {
-    theta: 0.5,
     fint: 1,
     iters: 4,
     omega: 1.0,
@@ -60,7 +55,6 @@ const REF_KNOBS: Knobs = Knobs {
 /// with the constants in physics.rs. Used by sweeps that pin everything but
 /// the knob under study.
 const ADOPTED_KNOBS: Knobs = Knobs {
-    theta: 0.9,
     fint: 4,
     iters: 3,
     omega: 1.0,
@@ -72,8 +66,8 @@ struct RunResult {
     particles: usize,
     path: ForcePath,
     steps: usize,
-    /// mean µs/step: integrate, grid build, tree build, forces, solver
-    phase_means_us: [f64; 5],
+    /// mean µs/step: integrate, grid build, forces, solver
+    phase_means_us: [f64; 4],
     mean_us: f64,
     median_us: f64,
     p95_us: f64,
@@ -203,21 +197,16 @@ fn run_opts(
         2000.0,
     );
 
-    // Defaults are: barnes-hut ON, verlet ON, adaptive dt ON.
+    // Defaults are: verlet ON, adaptive dt ON.
     // Adaptive dt is always disabled for deterministic timing.
     physics.toggle_adaptive_dt();
     match path {
-        ForcePath::BarnesHut => {}
-        ForcePath::VerletLists => {
-            physics.toggle_barnes_hut();
-        }
+        ForcePath::VerletLists => {}
         ForcePath::SpatialHash => {
-            physics.toggle_barnes_hut();
             physics.toggle_verlet_lists();
         }
     }
     let apply = |physics: &mut Physics, k: Knobs| {
-        physics.set_bh_theta(k.theta);
         physics.set_force_interval(k.fint);
         physics.set_solver_iterations(k.iters);
         physics.set_solver_omega(k.omega);
@@ -247,7 +236,7 @@ fn run_opts(
     }
 
     let mut step_times_us = Vec::with_capacity(steps);
-    let mut phase_sums_us = [0u64; 5]; // integrate, grid build, tree build, forces, solver
+    let mut phase_sums_us = [0u64; 4]; // integrate, grid build, forces, solver
     for _ in 0..steps {
         let t = Instant::now();
         physics.step(PHYS_TIME_STEP, &mut share);
@@ -255,9 +244,8 @@ fn run_opts(
         let ps = &share.perf_stats;
         phase_sums_us[0] += ps.integration_time_us;
         phase_sums_us[1] += ps.neighbor_rebuild_time_us;
-        phase_sums_us[2] += ps.tree_build_time_us;
-        phase_sums_us[3] += ps.force_calc_time_us;
-        phase_sums_us[4] += ps.collision_time_us;
+        phase_sums_us[2] += ps.force_calc_time_us;
+        phase_sums_us[3] += ps.collision_time_us;
     }
 
     // Sanity checks: the optimizations must not blow up the simulation.
@@ -289,12 +277,13 @@ fn run_opts(
     }
 }
 
-/// θ accuracy study: settle a state under reference physics, then compare
-/// Barnes-Hut forces at several opening angles against the exact O(n²) sum.
-/// Error metric: relative RMS, sqrt(Σ|ΔF|² / Σ|F_exact|²).
-fn force_error_mode() {
-    println!("| particles | theta | rel RMS force error | serial traversal ms |");
-    println!("|---|---|---|---|");
+/// Model validation: the cutoff (≤ one grid cell) makes the 3×3 stencil
+/// provably complete, so the engine's grid gather must equal the exact
+/// O(n²) sum up to summation-order rounding. Reports the relative RMS
+/// difference — anything above float-noise level (~1e-6) is a bug.
+fn validate_mode() {
+    println!("| particles | grid vs direct rel RMS diff | verdict |");
+    println!("|---|---|---|");
     for &n in &[3_000usize, 12_000] {
         let positions = init_particles(n);
         let (_tx, rx) = channel();
@@ -306,7 +295,6 @@ fn force_error_mode() {
             ..Default::default()
         };
         // Settle under reference knobs so the state is representative.
-        physics.set_bh_theta(REF_KNOBS.theta);
         physics.set_force_interval(REF_KNOBS.fint);
         physics.set_solver_iterations(REF_KNOBS.iters);
         physics.set_solver_omega(REF_KNOBS.omega);
@@ -316,24 +304,19 @@ fn force_error_mode() {
 
         let exact = physics.forces_direct(&share.c_pos);
         let exact_sq: f64 = exact.iter().map(|f| f.length_squared() as f64).sum();
-
-        for &theta in &[0.3f32, 0.5, 0.7, 0.9, 1.1] {
-            let t = Instant::now();
-            let approx = physics.forces_barnes_hut_at(&share.c_pos, theta);
-            let ms = t.elapsed().as_secs_f64() * 1e3;
-            let err_sq: f64 = approx
-                .iter()
-                .zip(&exact)
-                .map(|(a, e)| (*a - *e).length_squared() as f64)
-                .sum();
-            println!(
-                "| {} | {:.1} | {:.2e} | {:.1} |",
-                n,
-                theta,
-                (err_sq / exact_sq).sqrt(),
-                ms
-            );
-        }
+        let grid = physics.forces_grid(&share.c_pos);
+        let err_sq: f64 = grid
+            .iter()
+            .zip(&exact)
+            .map(|(a, e)| (*a - *e).length_squared() as f64)
+            .sum();
+        let rel = (err_sq / exact_sq).sqrt();
+        println!(
+            "| {} | {:.2e} | {} |",
+            n,
+            rel,
+            if rel < 1e-5 { "exact (fp noise)" } else { "MISMATCH" }
+        );
     }
 }
 
@@ -352,7 +335,6 @@ fn small_steps_mode() {
         ("S=3 it=1 K=12", Knobs { substeps: 3, iters: 1, fint: 12, ..ADOPTED_KNOBS }),
     ];
     let configs: &[(usize, ForcePath)] = &[
-        (12_000, ForcePath::BarnesHut),
         (12_000, ForcePath::VerletLists),
         (24_000, ForcePath::SpatialHash),
     ];
@@ -429,9 +411,9 @@ fn soak_mode() {
     println!("| particles | path | steps | mean µs | max pen % | mean pen % | deep pairs | sane? |");
     println!("|---|---|---|---|---|---|---|---|");
     for &(n, path) in &[
-        (12_000usize, ForcePath::BarnesHut),
-        (12_000, ForcePath::VerletLists),
+        (12_000usize, ForcePath::VerletLists),
         (16_000, ForcePath::SpatialHash),
+        (24_000, ForcePath::SpatialHash),
     ] {
         let r = run_config(n, 2_400, 0, path, None);
         let sane = if r.nan_count == 0 && r.escaped_count == 0 {
@@ -463,21 +445,6 @@ fn sweep_mode() {
     // of mid-collapse (where chaotic divergence swamps systematic error).
     const WARMUP: usize = 480;
 
-    let bh_variants: &[(&str, Knobs)] = &[
-        ("θ=0.5 K=4", Knobs { theta: 0.5, fint: 4, ..REF_KNOBS }),
-        ("θ=0.7 K=1", Knobs { theta: 0.7, ..REF_KNOBS }),
-        ("θ=0.9 K=1", Knobs { theta: 0.9, ..REF_KNOBS }),
-        ("θ=0.9 K=4", Knobs { theta: 0.9, fint: 4, ..REF_KNOBS }),
-        ("θ=0.9 K=8", Knobs { theta: 0.9, fint: 8, ..REF_KNOBS }),
-        (
-            "combo-safe θ=0.9 K=4 it=3 ω=1.0",
-            Knobs { theta: 0.9, fint: 4, iters: 3, omega: 1.0, ..REF_KNOBS },
-        ),
-        (
-            "combo-fast θ=0.9 K=4 it=2 ω=1.25",
-            Knobs { theta: 0.9, fint: 4, iters: 2, omega: 1.25, ..REF_KNOBS },
-        ),
-    ];
     let grid_variants: &[(&str, Knobs)] = &[
         ("K=4", Knobs { fint: 4, ..REF_KNOBS }),
         ("it=3 ω=1.0", Knobs { iters: 3, ..REF_KNOBS }),
@@ -504,8 +471,6 @@ fn sweep_mode() {
     // numbers measure the scenario, not the solver. 24k stays for timing
     // continuity with the earlier series.
     let configs: &[(usize, ForcePath, &[(&str, Knobs)])] = &[
-        (3_000, ForcePath::BarnesHut, bh_variants),
-        (12_000, ForcePath::BarnesHut, bh_variants),
         (12_000, ForcePath::VerletLists, grid_variants),
         (16_000, ForcePath::SpatialHash, grid_variants),
         (24_000, ForcePath::SpatialHash, grid_variants),
@@ -558,8 +523,8 @@ fn main() {
 
     let quick = std::env::args().any(|a| a == "--quick");
     let phases = std::env::args().any(|a| a == "--phases");
-    if std::env::args().any(|a| a == "--force-error") {
-        force_error_mode();
+    if std::env::args().any(|a| a == "--validate") {
+        validate_mode();
         return;
     }
     if std::env::args().any(|a| a == "--sweep") {
@@ -579,19 +544,19 @@ fn main() {
         return;
     }
     if phases {
-        println!("| particles | force path | integrate | grid build | tree build | forces | solver | total step (mean) |");
-        println!("|---|---|---|---|---|---|---|---|");
+        println!("| particles | force path | integrate | grid build | forces | solver | total step (mean) |");
+        println!("|---|---|---|---|---|---|---|");
         for &(particles, steps) in if quick {
             &[(1_000usize, 120usize), (6_000, 40)][..]
         } else {
             &[(3_000, 200), (12_000, 60), (24_000, 40)][..]
         } {
-            for path in [ForcePath::BarnesHut, ForcePath::VerletLists, ForcePath::SpatialHash] {
+            for path in [ForcePath::VerletLists, ForcePath::SpatialHash] {
                 let r = run_config(particles, steps, steps / 10 + 5, path, None);
                 let p = r.phase_means_us;
                 println!(
-                    "| {} | {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} |",
-                    particles, path.label(), p[0], p[1], p[2], p[3], p[4], r.mean_us,
+                    "| {} | {} | {:.0} | {:.0} | {:.0} | {:.0} | {:.0} |",
+                    particles, path.label(), p[0], p[1], p[2], p[3], r.mean_us,
                 );
             }
         }
@@ -607,7 +572,7 @@ fn main() {
     println!("|---|---|---|---|---|---|---|---|---|---|---|");
 
     for &(particles, steps) in configs {
-        for path in [ForcePath::BarnesHut, ForcePath::VerletLists, ForcePath::SpatialHash] {
+        for path in [ForcePath::VerletLists, ForcePath::SpatialHash] {
             let r = run_config(particles, steps, steps / 10 + 5, path, None);
             let realtime = if r.median_us <= REALTIME_BUDGET_US { "yes" } else { "NO" };
             let sane = if r.nan_count == 0 && r.escaped_count == 0 {

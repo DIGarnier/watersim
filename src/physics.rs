@@ -10,6 +10,30 @@ use crate::constants::{
 const GRAVITY: Vec2 = Vec2::new(0.0, 9.8);
 pub const PHYS_TIME_STEP: f32 = 1.0 / 480.0;
 
+// The force model (stage 25): *local* repulsion with compact support, like
+// every particle water model (SPH kernels, PBF, Clavet 2005 — pressure in a
+// liquid is local; docs/literature.md §9). The 1/r² kernel acts from
+// BALL_SIZE out to FORCE_CUTOFF = 2.5 ball radii = one grid cell, which
+// makes the one-cell grid stencil *exact*: every interacting pair is
+// guaranteed inside the 3×3 neighborhood. A smoothstep taper (in r²) takes
+// the force continuously to zero between the contact distance and the
+// cutoff, so pairs crossing the cutoff never pop. This replaced the
+// previous split personality — Barnes-Hut mode summed the repulsion
+// globally while the grid modes truncated it at stencil geometry — see
+// docs/benchmarks/25-cutoff-model.md.
+const FORCE_CUTOFF: f32 = GRID_SIZE;
+const FORCE_CUTOFF_SQ: f32 = FORCE_CUTOFF * FORCE_CUTOFF;
+const TAPER_START_SQ: f32 = (2.0 * BALL_SIZE) * (2.0 * BALL_SIZE);
+const INV_TAPER_SPAN: f32 = 1.0 / (FORCE_CUTOFF_SQ - TAPER_START_SQ);
+
+/// Smoothstep window on r²: 1 below the contact distance, 0 at the cutoff,
+/// C¹ at both ends. Branchless.
+#[inline(always)]
+fn taper(dist_sq: f32) -> f32 {
+    let u = ((dist_sq - TAPER_START_SQ) * INV_TAPER_SPAN).clamp(0.0, 1.0);
+    1.0 - u * u * (3.0 - 2.0 * u)
+}
+
 // Optimization constants
 const VERLET_SKIN_DISTANCE: f32 = BALL_SIZE * 0.5; // Extra distance for neighbor lists
 // When neighbor lists have gone stale (something moved > skin/2), forces fall
@@ -27,19 +51,13 @@ const ADAPTIVE_DT_MIN: f32 = PHYS_TIME_STEP * 0.1;
 const ADAPTIVE_DT_MAX: f32 = PHYS_TIME_STEP * 2.0;
 const MAX_SAFE_VELOCITY: f32 = 100.0; // Reduce dt when velocities exceed this
 
-// Barnes-Hut opening angle. Monopole force error grows ~θ²; the sweep in
-// docs/benchmarks/13-bh-theta.md measured the actual error/speed curve for
-// this sim and picked the default. Runtime-tunable via `set_bh_theta`.
-const BARNES_HUT_THETA: f32 = 0.9;
-
-// Far-field force refresh interval, in substeps (RESPA-style multiple time
-// stepping; Tuckerman, Berne & Martyna 1992, docs/literature.md §7). The
-// repulsion field is smooth and positions move a tiny fraction of a cell per
-// 480 Hz substep, so the expensive force pass (BH tree or grid gather) is
-// recomputed only every K substeps and reused in between. The contact solver
-// — the fast, stiff part — still runs every substep. Quality was measured in
-// docs/benchmarks/14-mts-farfield.md. Runtime-tunable via
-// `set_force_interval`; 1 = recompute every substep (old behavior).
+// Force refresh interval, in substeps (RESPA-style multiple time stepping;
+// Tuckerman, Berne & Martyna 1992, docs/literature.md §7). The repulsion
+// field is smooth and positions move a tiny fraction of a cell per 480 Hz
+// substep, so the force gather is recomputed only every K substeps and
+// reused in between. The contact solver — the fast, stiff part — still runs
+// every substep. Quality was measured in docs/benchmarks/14-mts-farfield.md.
+// Runtime-tunable via `set_force_interval`; 1 = recompute every substep.
 const FORCE_INTERVAL: usize = 4;
 
 // Constraint-projection iterations per substep. The sim already substeps at
@@ -64,8 +82,7 @@ const SOLVER_OMEGA: f32 = 1.0;
 // cost profile (docs/benchmarks/18-engine-crossover.md): packed now wins at
 // ~16-20k on spatial-hash but only ~24k on verlet-lists, margins within the
 // VM noise band, so the single threshold sits between. Runtime-tunable via
-// `set_par_min_particles`. The Barnes-Hut traversal has no threshold: it is
-// one region of heavy independent work and wins at every tested size.
+// `set_par_min_particles`.
 const PAR_MIN_PARTICLES: usize = 22_000;
 
 const LEFT_WALL: f32 = 0.;
@@ -76,7 +93,6 @@ const TOP_WALL: f32 = HEIGHT;
 pub enum EventToPthread {
     Cannon((Vec2, Vec2)),
     Scale(f32),
-    ToggleBarnesHut,
     ToggleVerletLists,
     ToggleAdaptiveDt,
 }
@@ -95,276 +111,11 @@ pub struct PerformanceStats {
     pub integration_time_us: u64,
     pub collision_time_us: u64,
     pub neighbor_rebuild_time_us: u64,
-    pub tree_build_time_us: u64,
     pub force_calc_time_us: u64,
     pub total_particles: usize,
-    pub neighbor_checks: usize,
-    pub tree_node_count: usize,
-    pub barnes_hut_enabled: bool,
     pub verlet_lists_enabled: bool,
     pub adaptive_dt_enabled: bool,
     pub current_dt: f32,
-}
-
-#[derive(Clone, Copy)]
-struct AABB {
-    min: Vec2,
-    max: Vec2,
-}
-
-impl AABB {
-    fn new(min: Vec2, max: Vec2) -> Self {
-        Self { min, max }
-    }
-
-    fn center(&self) -> Vec2 {
-        (self.min + self.max) * 0.5
-    }
-
-    fn size(&self) -> f32 {
-        (self.max.x - self.min.x).max(self.max.y - self.min.y)
-    }
-
-    fn quadrant(&self, idx: usize) -> AABB {
-        let center = self.center();
-        match idx {
-            0 => AABB::new(self.min, center), // Bottom-left
-            1 => AABB::new(Vec2::new(center.x, self.min.y), Vec2::new(self.max.x, center.y)), // Bottom-right
-            2 => AABB::new(Vec2::new(self.min.x, center.y), Vec2::new(center.x, self.max.y)), // Top-left
-            3 => AABB::new(center, self.max), // Top-right
-            _ => unreachable!(),
-        }
-    }
-}
-
-const BH_NONE: u32 = u32::MAX;
-
-// Max particles per leaf before it subdivides. Bucketed leaves keep the tree
-// shallow and turn near-field work into tight exact loops (standard treecode
-// practice; see docs/literature.md §3).
-const BH_LEAF_CAP: u32 = 8;
-
-/// Traversal-hot node data: 24 bytes, so ~2.7 nodes per cache line versus 44
-/// bytes when bounds/count rode along. Force traversal touches only this.
-#[derive(Clone, Copy)]
-struct BhHot {
-    center_of_mass: Vec2,
-    total_mass: f32,
-    size_sq: f32,   // bounds.size()² cached for the sqrt-free acceptance test
-    children: u32,  // BH_NONE = leaf, else index of first of 4 contiguous children
-    leaf_start: u32, // offset into the packed leaf-member arrays (set by finalize)
-    leaf_count: u32,
-}
-
-/// Arena-backed Barnes-Hut quadtree (Burtscher & Pingali 2011 style: contiguous
-/// node storage, no per-node allocation, non-recursive traversal). Node data is
-/// split hot/cold: `hot` is everything the force traversal reads; `bounds` and
-/// `count` exist only for tree construction. All buffers keep their capacity
-/// across frames, so steady-state tree builds are allocation-free.
-struct BhTree {
-    hot: Vec<BhHot>,
-    bounds: Vec<AABB>, // build-only
-    count: Vec<u32>,   // build-only: particles in each leaf
-    first: Vec<u32>,   // build-only: head of each leaf's intrusive member list
-    next: Vec<u32>,    // per-particle intrusive list linking leaf members
-    ppos: Vec<Vec2>,   // per-particle (clamped) position as inserted
-    // Leaf members packed contiguously by finalize(): the near-field loop
-    // streams these instead of chasing next[] through scattered ppos.
-    leaf_x: Vec<f32>,
-    leaf_y: Vec<f32>,
-}
-
-impl BhTree {
-    fn new() -> Self {
-        Self {
-            hot: Vec::new(),
-            bounds: Vec::new(),
-            count: Vec::new(),
-            first: Vec::new(),
-            next: Vec::new(),
-            ppos: Vec::new(),
-            leaf_x: Vec::new(),
-            leaf_y: Vec::new(),
-        }
-    }
-
-    fn push_node(&mut self, bounds: AABB) {
-        self.hot.push(BhHot {
-            center_of_mass: Vec2::ZERO,
-            total_mass: 0.0,
-            size_sq: bounds.size() * bounds.size(),
-            children: BH_NONE,
-            leaf_start: 0,
-            leaf_count: 0,
-        });
-        self.bounds.push(bounds);
-        self.count.push(0);
-        self.first.push(BH_NONE);
-    }
-
-    fn clear(&mut self, bounds: AABB, n_particles: usize) {
-        self.hot.clear();
-        self.bounds.clear();
-        self.count.clear();
-        self.first.clear();
-        self.push_node(bounds);
-        self.next.resize(n_particles, BH_NONE);
-        self.ppos.resize(n_particles, Vec2::ZERO);
-    }
-
-    /// Copy every leaf's members into the contiguous arrays and stamp the
-    /// (offset, count) into the hot nodes. One O(nodes + n) pass after build.
-    fn finalize(&mut self) {
-        self.leaf_x.clear();
-        self.leaf_y.clear();
-        for node in 0..self.hot.len() {
-            if self.hot[node].children != BH_NONE {
-                continue;
-            }
-            let start = self.leaf_x.len() as u32;
-            let mut p = self.first[node];
-            while p != BH_NONE {
-                let pos = self.ppos[p as usize];
-                self.leaf_x.push(pos.x);
-                self.leaf_y.push(pos.y);
-                p = self.next[p as usize];
-            }
-            let h = &mut self.hot[node];
-            h.leaf_start = start;
-            h.leaf_count = self.leaf_x.len() as u32 - start;
-        }
-    }
-
-    #[inline(always)]
-    fn quadrant_index(bounds: &AABB, pos: Vec2) -> usize {
-        let c = bounds.center();
-        ((pos.y >= c.y) as usize) * 2 + ((pos.x >= c.x) as usize)
-    }
-
-    #[inline(always)]
-    fn fold_into(hot: &mut BhHot, pos: Vec2, mass: f32) {
-        let total = hot.total_mass + mass;
-        hot.center_of_mass = (hot.center_of_mass * hot.total_mass + pos * mass) / total;
-        hot.total_mass = total;
-    }
-
-    fn insert(&mut self, idx: u32, pos: Vec2, mass: f32) {
-        // Below this cell size, keep piling particles into the leaf instead of
-        // subdividing forever (guards against (near-)coincident particles).
-        const MIN_CELL: f32 = 1e-3;
-
-        self.ppos[idx as usize] = pos;
-        let mut node = 0usize;
-        loop {
-            let n = self.hot[node];
-
-            if n.children != BH_NONE {
-                // Internal node: fold the new mass into the aggregate, descend.
-                Self::fold_into(&mut self.hot[node], pos, mass);
-                node = n.children as usize + Self::quadrant_index(&self.bounds[node], pos);
-                continue;
-            }
-
-            if self.count[node] < BH_LEAF_CAP || self.bounds[node].size() < MIN_CELL {
-                // Leaf with room: link the particle in and update the aggregate.
-                self.next[idx as usize] = self.first[node];
-                self.first[node] = idx;
-                self.count[node] += 1;
-                Self::fold_into(&mut self.hot[node], pos, mass);
-                return;
-            }
-
-            // Full leaf: subdivide and redistribute the residents, then retry
-            // this node (now internal) with the incoming particle.
-            let node_bounds = self.bounds[node];
-            let first_child = self.hot.len() as u32;
-            for q in 0..4 {
-                self.push_node(node_bounds.quadrant(q));
-            }
-
-            let mut p = self.first[node];
-            let per_particle_mass = n.total_mass / self.count[node] as f32;
-            while p != BH_NONE {
-                let p_next = self.next[p as usize];
-                let p_pos = self.ppos[p as usize];
-                let child = first_child as usize + Self::quadrant_index(&node_bounds, p_pos);
-                self.next[p as usize] = self.first[child];
-                self.first[child] = p;
-                self.count[child] += 1;
-                Self::fold_into(&mut self.hot[child], p_pos, per_particle_mass);
-                p = p_next;
-            }
-
-            self.hot[node].children = first_child;
-            self.first[node] = BH_NONE;
-            self.count[node] = 0;
-        }
-    }
-
-    /// Traversal is read-only so it can run for many particles in parallel;
-    /// callers supply a reusable scratch stack (one per thread).
-    fn compute_force(&self, pos: Vec2, scale: f32, theta: f32, stack: &mut Vec<u32>) -> Vec2 {
-        let theta_sq = theta * theta;
-        let mut force = Vec2::ZERO;
-        stack.clear();
-        stack.push(0);
-
-        while let Some(idx) = stack.pop() {
-            let n = &self.hot[idx as usize];
-            if n.total_mass == 0.0 {
-                continue;
-            }
-
-            // Repulsion, matching the exact pair kernel `force()`: diff points
-            // from the aggregate mass toward the particle. (The original BH
-            // code had this inverted — attraction — so toggling BH silently
-            // simulated a different system; see docs/benchmarks/13-bh-theta.md.)
-            let diff = pos - n.center_of_mass;
-            let dist_sq = diff.length_squared();
-
-            // size/dist < theta  <=>  size² < theta²·dist², sqrt-free
-            if n.size_sq < theta_sq * dist_sq {
-                // Far enough: use the aggregate (internal or leaf alike).
-                if dist_sq < BALL_SIZE * BALL_SIZE {
-                    continue;
-                }
-                // == normalize(diff) * scale * mass / max(dist², 1)
-                force += diff * (scale * n.total_mass * fast_rsqrt(dist_sq) / dist_sq.max(1.0));
-            } else if n.children != BH_NONE {
-                let c = n.children;
-                // The 4 children (96 B, contiguous) will be popped within the
-                // next few iterations; start their cache lines now.
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                    let p = self.hot.as_ptr().add(c as usize) as *const i8;
-                    _mm_prefetch(p, _MM_HINT_T0);
-                    _mm_prefetch(p.add(64), _MM_HINT_T0);
-                }
-                stack.extend_from_slice(&[c, c + 1, c + 2, c + 3]);
-            } else {
-                // Near leaf: exact particle-particle interactions over the
-                // packed member slice — contiguous, branchless (masked), and
-                // free of the old next[]-chain dependent loads. Self and
-                // touching pairs mask out; the clamp keeps lanes finite.
-                const BALL_SQ: f32 = BALL_SIZE * BALL_SIZE;
-                let start = n.leaf_start as usize;
-                let end = start + n.leaf_count as usize;
-                for k in start..end {
-                    let dx = pos.x - self.leaf_x[k];
-                    let dy = pos.y - self.leaf_y[k];
-                    let d2 = dx * dx + dy * dy;
-                    let m = if d2 >= BALL_SQ { 1.0f32 } else { 0.0 };
-                    // active pairs have d2 ≥ BALL² > 1, so max(d2,1) == d2c
-                    let d2c = d2.max(BALL_SQ);
-                    let w = (scale * m) / (d2c.sqrt() * d2c);
-                    force += Vec2::new(dx * w, dy * w);
-                }
-            }
-        }
-
-        force
-    }
 }
 
 /// Verlet neighbor lists in flat CSR layout: one contiguous `neighbors` array
@@ -539,10 +290,13 @@ fn gather_force(
             let dx = xa - px[k];
             let dy = ya - py[k];
             let d2 = dx * dx + dy * dy;
-            let m = if d2 >= BALL_SQ { 1.0f32 } else { 0.0 };
-            // active pairs have d2 ≥ BALL² > 1, so max(d2,1) == d2 here
+            let m = if d2 >= BALL_SQ && d2 < FORCE_CUTOFF_SQ {
+                1.0f32
+            } else {
+                0.0
+            };
             let d2c = d2.max(BALL_SQ);
-            let w = (s8 * m) / (d2c.sqrt() * d2c);
+            let w = (s8 * m * taper(d2)) / (d2c.sqrt() * d2c);
             fx += dx * w;
             fy += dy * w;
         }
@@ -666,7 +420,6 @@ pub struct Physics {
     c_opos: Vec<Vec2>,
     c_force: Vec<Vec2>,
     grid: CsrGrid,
-    bh_tree: BhTree,
     pub rx: Receiver<EventToPthread>,
     pub scale: f32,
 
@@ -686,11 +439,9 @@ pub struct Physics {
     // `force_interval` substeps, reused in between (empty = no valid cache).
     c_farfield: Vec<Vec2>,
     frame_count: usize,
-    use_barnes_hut: bool,
     use_verlet_lists: bool,
     use_adaptive_dt: bool,
     adaptive_dt: f32,
-    bh_theta: f32,
     force_interval: usize,
     solver_iterations: usize,
     solver_omega: f32,
@@ -712,7 +463,6 @@ impl Physics {
             c_opos,
             c_force,
             grid: CsrGrid::new(),
-            bh_tree: BhTree::new(),
             rx,
             scale,
             neighbor_lists: VerletLists::default(),
@@ -726,11 +476,9 @@ impl Physics {
             packed_cell: Vec::new(),
             c_farfield: Vec::new(),
             frame_count: 0,
-            use_barnes_hut: true,  // Enable Barnes-Hut by default
             use_verlet_lists: true, // Enable Verlet lists by default
             use_adaptive_dt: true,  // Enable adaptive time-stepping by default
             adaptive_dt: PHYS_TIME_STEP,
-            bh_theta: BARNES_HUT_THETA,
             force_interval: FORCE_INTERVAL,
             solver_iterations: SOLVER_ITERATIONS,
             solver_omega: SOLVER_OMEGA,
@@ -738,11 +486,6 @@ impl Physics {
             substeps: 1,
             last_max_velocity: 0.0,
         }
-    }
-
-    /// Barnes-Hut opening angle (accuracy/speed knob; error ~ θ²).
-    pub fn set_bh_theta(&mut self, theta: f32) {
-        self.bh_theta = theta;
     }
 
     /// Far-field force refresh interval in substeps (1 = every substep).
@@ -789,7 +532,6 @@ impl Physics {
         let ps = &mut share.perf_stats;
         ps.integration_time_us = 0;
         ps.neighbor_rebuild_time_us = 0;
-        ps.tree_build_time_us = 0;
         ps.force_calc_time_us = 0;
         ps.collision_time_us = 0;
 
@@ -803,7 +545,6 @@ impl Physics {
 
         // Update performance stats
         share.perf_stats.total_particles = share.c_pos.len();
-        share.perf_stats.barnes_hut_enabled = self.use_barnes_hut;
         share.perf_stats.verlet_lists_enabled = self.use_verlet_lists;
         share.perf_stats.adaptive_dt_enabled = self.use_adaptive_dt;
         share.perf_stats.current_dt = effective_dt;
@@ -956,11 +697,7 @@ impl Physics {
             || self.c_farfield.len() != c_pos.len()
             || self.frame_count % self.force_interval == 0;
         if refresh {
-            if self.use_barnes_hut {
-                self.compute_forces_barnes_hut(c_pos, stats);
-            } else {
-                self.compute_forces_naive(c_pos);
-            }
+            self.compute_forces(c_pos);
             if self.force_interval > 1 {
                 self.c_farfield.clear();
                 self.c_farfield.extend_from_slice(&self.c_force);
@@ -1007,57 +744,45 @@ impl Physics {
         }
     }
 
-    /// Rebuild the arena tree (capacity persists across frames).
-    fn build_bh_tree(&mut self, c_pos: &[Vec2]) {
-        let bounds = AABB::new(
-            Vec2::new(LEFT_WALL, BOTTOM_WALL),
-            Vec2::new(RIGHT_WALL, TOP_WALL),
-        );
-        self.bh_tree.clear(bounds, c_pos.len());
-
-        for (i, &pos) in c_pos.iter().enumerate() {
-            // The old tree silently dropped out-of-bounds particles; clamping
-            // keeps them contributing from the nearest edge instead.
-            self.bh_tree
-                .insert(i as u32, pos.clamp(bounds.min, bounds.max), 1.0);
-        }
-        self.bh_tree.finalize();
-    }
-
-    fn compute_forces_barnes_hut(&mut self, c_pos: &[Vec2], stats: &mut PerformanceStats) {
-        let t = Instant::now();
-        self.build_bh_tree(c_pos);
-        stats.tree_build_time_us += t.elapsed().as_micros() as u64;
-        stats.tree_node_count = self.bh_tree.hot.len();
-
-        // Independent read-only traversals: parallelize over particles with a
-        // per-thread scratch stack.
-        let (tree, scale, theta) = (&self.bh_tree, self.scale, self.bh_theta);
-        self.c_force
-            .par_iter_mut()
-            .enumerate()
-            .for_each_init(
-                || Vec::with_capacity(256),
-                |stack, (i, f)| {
-                    *f += tree.compute_force(c_pos[i], scale, theta, stack) / 8.0;
-                },
-            );
-    }
-
-    /// Bench/test hook: Barnes-Hut forces for `positions` at an explicit θ,
-    /// same scaling as the engine's force pass. Not used by the sim loop.
-    pub fn forces_barnes_hut_at(&mut self, positions: &[Vec2], theta: f32) -> Vec<Vec2> {
-        self.build_bh_tree(positions);
-        let (tree, scale) = (&self.bh_tree, self.scale);
-        let mut stack = Vec::with_capacity(256);
+    /// Bench/test hook: the model's forces via the grid stencil, for
+    /// validating stencil exactness against `forces_direct` (the cutoff is
+    /// ≤ one cell, so the 3×3 neighborhood must contain every interacting
+    /// pair — any discrepancy beyond summation-order rounding is a bug).
+    pub fn forces_grid(&mut self, positions: &[Vec2]) -> Vec<Vec2> {
+        self.grid.build(positions);
+        let (grid, scale) = (&self.grid, self.scale);
         positions
             .iter()
-            .map(|&p| tree.compute_force(p, scale, theta, &mut stack) / 8.0)
+            .enumerate()
+            .map(|(i, &p)| {
+                let cell = grid.cell_of[i] as usize;
+                let (x, y) = (cell % GRID_W, cell / GRID_W);
+                let mut acc = Vec2::ZERO;
+                for dy in -1i32..=1 {
+                    let ny = y as i32 + dy;
+                    if ny < 0 || ny >= GRID_H as i32 {
+                        continue;
+                    }
+                    for dx in -1i32..=1 {
+                        let nx = x as i32 + dx;
+                        if nx < 0 || nx >= GRID_W as i32 {
+                            continue;
+                        }
+                        for &j in grid.cell(ny as usize * GRID_W + nx as usize) {
+                            if j as usize != i {
+                                acc += force(p, positions[j as usize], scale);
+                            }
+                        }
+                    }
+                }
+                acc / 8.0
+            })
             .collect()
     }
 
     /// Bench/test hook: exact O(n²) pairwise forces with the engine's kernel
-    /// and scaling — the ground truth the tree approximates.
+    /// and scaling — the model's ground truth, for validating that the grid
+    /// gathers compute the identical interaction set.
     pub fn forces_direct(&self, positions: &[Vec2]) -> Vec<Vec2> {
         let scale = self.scale;
         positions
@@ -1072,7 +797,7 @@ impl Physics {
             .collect()
     }
 
-    fn compute_forces_naive(&mut self, c_pos: &[Vec2]) {
+    fn compute_forces(&mut self, c_pos: &[Vec2]) {
         if self.use_verlet_lists {
             if !self.neighbor_lists.needs_rebuild(c_pos) {
                 self.stale_steps = 0;
@@ -1102,20 +827,27 @@ impl Physics {
         lists.ref_pos.clear();
         lists.ref_pos.extend_from_slice(c_pos);
 
-        let interaction_range_sq =
-            (BALL_SIZE * 2.0 + VERLET_SKIN_DISTANCE) * (BALL_SIZE * 2.0 + VERLET_SKIN_DISTANCE);
+        // Lists must hold every pair that can come within FORCE_CUTOFF while
+        // displacements stay under skin/2 each — i.e. build out to
+        // cutoff + skin (9 px). That exceeds one cell (7.5 px), so the list
+        // build walks a 5×5 stencil. (Historically this range was
+        // 2·BALL + skin over 3×3, which silently truncated list-mode forces
+        // relative to the direct pass; with the stage-25 explicit cutoff the
+        // two modes now compute the same interaction set.)
+        let interaction_range_sq = (FORCE_CUTOFF + VERLET_SKIN_DISTANCE)
+            * (FORCE_CUTOFF + VERLET_SKIN_DISTANCE);
         for i in 0..c_pos.len() {
             lists.start[i] = lists.neighbors.len() as u32;
 
             let cell = self.grid.cell_of[i] as usize;
             let (x, y) = (cell % GRID_W, cell / GRID_W);
 
-            for dy in -1i32..=1 {
+            for dy in -2i32..=2 {
                 let ny = y as i32 + dy;
                 if ny < 0 || ny >= GRID_H as i32 {
                     continue;
                 }
-                for dx in -1i32..=1 {
+                for dx in -2i32..=2 {
                     let nx = x as i32 + dx;
                     if nx < 0 || nx >= GRID_W as i32 {
                         continue;
@@ -1402,11 +1134,6 @@ impl Physics {
         }
     }
 
-    pub fn toggle_barnes_hut(&mut self) {
-        self.use_barnes_hut = !self.use_barnes_hut;
-        println!("Barnes-Hut: {}", if self.use_barnes_hut { "ON" } else { "OFF" });
-    }
-
     pub fn toggle_verlet_lists(&mut self) {
         self.use_verlet_lists = !self.use_verlet_lists;
         println!("Verlet Lists: {}", if self.use_verlet_lists { "ON" } else { "OFF" });
@@ -1471,12 +1198,14 @@ mod tests {
 fn force(pos_a: Vec2, pos_b: Vec2, scale: f32) -> Vec2 {
     let dir = pos_a - pos_b;
     let dist_sq = dir.length_squared();
-    if dist_sq < BALL_SIZE * BALL_SIZE {
+    if dist_sq < BALL_SIZE * BALL_SIZE || dist_sq >= FORCE_CUTOFF_SQ {
         return Vec2::ZERO;
     }
 
-    // == normalize(dir) * scale / max(dist², 1), with one rsqrt total
-    dir * (scale * fast_rsqrt(dist_sq) / dist_sq.max(1.0))
+    // == normalize(dir) * scale * taper / dist², with one rsqrt total
+    // (active pairs have dist² ≥ BALL² > 1, so the historical max(dist², 1)
+    // clamp is a no-op and was dropped)
+    dir * (scale * taper(dist_sq) * fast_rsqrt(dist_sq) / dist_sq)
 }
 
 enum Collision {
