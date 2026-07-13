@@ -23,6 +23,7 @@ Final report with baseline→final tables:
 | 21 | [21-dt2-integrator.md](21-dt2-integrator.md) | integrator fix: a·dt → a·dt² (impulse → acceleration) | behavior-preserving at 480 Hz; dynamics now dt-consistent (enables 22) |
 | 22 | [22-small-steps.md](22-small-steps.md) | proper Small Steps: S substeps × fewer iterations (`set_substeps`) | BH path: S=2×it=1 is −12 % **and** better contacts; grid paths prefer iterations — defaults unchanged |
 | 23 | [23-cluster-gather.md](23-cluster-gather.md) | i-cluster union-stencil gather for the packed solver (bit-exact) | packed solver phase −42 % at 24k; verlet 24k mean −29 % |
+| 24 | [24-cluster-force-gather-rejected.md](24-cluster-force-gather-rejected.md) | clustering the packed *force* gather (index-range masks) | **rejected**: ~15 % slower — kernel is FLOP-bound (no cutoff), no idle lanes to reclaim |
 
 Net (mean µs/step, defaults, same-day A/B chains): BH path 2.5–4.2× faster;
 grid paths ~1.4× at solver-dominated sizes, another ~1.3× from stages

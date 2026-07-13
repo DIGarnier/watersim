@@ -44,5 +44,6 @@ now bounded by the force pass + grid build again.
 ## Decision
 
 Adopted (it is the packed engine's default gather). The same treatment for
-the packed force gather would need a cutoff-preserving formulation first —
-noted as the remaining width follow-up.
+the packed force gather was tried with a cutoff-preserving index-mask
+formulation and measured ~15 % *slower* — that kernel is FLOP-bound, not
+load-bound; see stage 24 for the rejection record.
