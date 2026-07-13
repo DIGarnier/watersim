@@ -42,6 +42,7 @@ struct Knobs {
     iters: usize,
     omega: f32,
     par_min: Option<usize>, // None = engine default crossover
+    substeps: usize,
 }
 
 /// The configuration this optimization pass started from (stage-11 behavior):
@@ -52,6 +53,7 @@ const REF_KNOBS: Knobs = Knobs {
     iters: 4,
     omega: 1.0,
     par_min: None,
+    substeps: 1,
 };
 
 /// The defaults adopted at the end of the pass (stages 13–15) — keep in sync
@@ -63,6 +65,7 @@ const ADOPTED_KNOBS: Knobs = Knobs {
     iters: 3,
     omega: 1.0,
     par_min: None,
+    substeps: 1,
 };
 
 struct RunResult {
@@ -221,6 +224,7 @@ fn run_opts(
         if let Some(pm) = k.par_min {
             physics.set_par_min_particles(pm);
         }
+        physics.set_substeps(k.substeps);
     };
     if let Some(k) = warmup_knobs {
         apply(&mut physics, k);
@@ -328,6 +332,58 @@ fn force_error_mode() {
                 theta,
                 (err_sq / exact_sq).sqrt(),
                 ms
+            );
+        }
+    }
+}
+
+/// Small Steps experiment (Macklin et al. 2019): S substeps × fewer solver
+/// iterations vs 1 substep × 3 iterations, at a held far-field refresh rate
+/// (force_interval scales with S). Quality read like sweep_mode: settle 1 s
+/// under the adopted defaults, then measure each variant from that state.
+fn small_steps_mode() {
+    const STEPS: usize = 240;
+    const WARMUP: usize = 480;
+    let variants: &[(&str, Knobs)] = &[
+        ("S=1 it=3 (adopted)", ADOPTED_KNOBS),
+        ("S=1 it=1 (iteration cut only)", Knobs { iters: 1, ..ADOPTED_KNOBS }),
+        ("S=2 it=1 K=8", Knobs { substeps: 2, iters: 1, fint: 8, ..ADOPTED_KNOBS }),
+        ("S=2 it=2 K=8", Knobs { substeps: 2, iters: 2, fint: 8, ..ADOPTED_KNOBS }),
+        ("S=3 it=1 K=12", Knobs { substeps: 3, iters: 1, fint: 12, ..ADOPTED_KNOBS }),
+    ];
+    let configs: &[(usize, ForcePath)] = &[
+        (12_000, ForcePath::BarnesHut),
+        (12_000, ForcePath::VerletLists),
+        (24_000, ForcePath::SpatialHash),
+    ];
+
+    println!("| particles | path | variant | mean µs | p95 µs | Δmean vs adopted | max pen % | mean pen % | deep pairs | density drift % | sane? |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|");
+    for &(n, path) in configs {
+        let run = |knobs: Knobs| {
+            run_opts(n, STEPS, WARMUP, path, Some(ADOPTED_KNOBS), Some(knobs), false)
+        };
+        let reference = run(ADOPTED_KNOBS);
+        for &(label, knobs) in variants {
+            let r = run(knobs);
+            let sane = if r.nan_count == 0 && r.escaped_count == 0 {
+                "ok".to_string()
+            } else {
+                format!("{} NaN, {} escaped", r.nan_count, r.escaped_count)
+            };
+            println!(
+                "| {} | {} | {} | {:.0} | {:.0} | {:+.0}% | {:.1} | {:.2} | {} | {:.2} | {} |",
+                n,
+                path.label(),
+                label,
+                r.mean_us,
+                r.p95_us,
+                (r.mean_us / reference.mean_us - 1.0) * 100.0,
+                r.quality.max_pen_pct,
+                r.quality.mean_pen_pct,
+                r.quality.deep_pairs,
+                density_drift_pct(&r.final_pos, &reference.final_pos),
+                sane
             );
         }
     }
@@ -516,6 +572,10 @@ fn main() {
     }
     if std::env::args().any(|a| a == "--engine-sweep") {
         engine_sweep_mode();
+        return;
+    }
+    if std::env::args().any(|a| a == "--small-steps") {
+        small_steps_mode();
         return;
     }
     if phases {

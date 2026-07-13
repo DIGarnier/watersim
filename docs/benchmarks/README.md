@@ -19,14 +19,23 @@ Final report with baseline→final tables:
 | 17 | [17-smaller-particles.md](17-smaller-particles.md) | smaller particulates: BALL_SIZE 4 → 3 | 24k scenario no longer over-fills: max pen 100 % → 0–0.5 % on grid paths; mid sizes −15…−35 % pending stage 19 |
 | 18 | [18-engine-crossover.md](18-engine-crossover.md) | re-swept serial↔packed solver threshold | PAR_MIN_PARTICLES 16k → 22k (crossover moved with the new cost profile) |
 | 19 | [19-grid-retune.md](19-grid-retune.md) | grid cell 10 → 7.5 px (= contact + skin) | stencil candidates ×0.56: grid paths −25…−29 % at 12–24k |
+| 20 | [20-coincident-tiebreak.md](20-coincident-tiebreak.md) | tie-break for exactly-coincident pairs + wall-clamp anti-stacking salt | "glued pair" absorbing state removed; regression test added |
+| 21 | [21-dt2-integrator.md](21-dt2-integrator.md) | integrator fix: a·dt → a·dt² (impulse → acceleration) | behavior-preserving at 480 Hz; dynamics now dt-consistent (enables 22) |
+| 22 | [22-small-steps.md](22-small-steps.md) | proper Small Steps: S substeps × fewer iterations (`set_substeps`) | BH path: S=2×it=1 is −12 % **and** better contacts; grid paths prefer iterations — defaults unchanged |
+| 23 | [23-cluster-gather.md](23-cluster-gather.md) | i-cluster union-stencil gather for the packed solver (bit-exact) | packed solver phase −42 % at 24k; verlet 24k mean −29 % |
 
 Net (mean µs/step, defaults, same-day A/B chains): BH path 2.5–4.2× faster;
-grid paths ~1.4× at solver-dominated sizes, then another ~1.3× from stages
-17+19 at equal physics quality. **Every path holds the 480 Hz median budget
-through 24 000 particles** (at pass start: no path at 24k, BH fell off at
-6k; BH at 24k is median-real-time — its MTS refresh spikes amortize across
-the frame, mean 3.7 ms). New harness modes: `--force-error`, `--sweep`
-(quality metrics + chaos-floor control), `--engine-sweep`, `--soak`.
+grid paths ~1.4× at solver-dominated sizes, another ~1.3× from stages
+17+19, and the packed engine another 1.15–1.4× from stage 23 — 24k
+end-state: verlet 1276 µs, spatial 1467 µs, BH 2916 µs mean. **Every path
+holds the 480 Hz median budget through 24 000 particles** (at pass start: no
+path at 24k, BH fell off at 6k; BH at 24k is median-real-time — its MTS
+refresh spikes amortize across the frame). Stages 20–21 are correctness
+work the instruments demanded: coincident pairs can't stay glued, and the
+integrator is dimensionally sound (a·dt²), which stage 22 turns into a
+measured Small-Steps quality/speed dial. New harness modes: `--force-error`,
+`--sweep` (quality metrics + chaos-floor control), `--engine-sweep`,
+`--small-steps`, `--soak`.
 
 ## First pass — 2026-07-01 (data structures & parallelism)
 
