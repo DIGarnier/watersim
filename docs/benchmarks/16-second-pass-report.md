@@ -56,6 +56,11 @@ is documented in stage 15 and reachable at runtime.
   i.e. the end states differ the way any two runs of a chaotic system
   differ, with no systematic bias the contact metrics can see.
 
+> **Addendum:** three of the follow-ups below were taken the same day in
+> stages 17–19 (smaller particulates fix the 24k scenario, the engine
+> crossover re-sweep, and a grid-cell re-tune) — see the series README.
+> Combined effect: every path real-time (480 Hz median) through 24k.
+
 ## Follow-ups (unchanged from stage 11, minus what this pass took)
 
 - The solver now dominates every path again (stage-16 phase profile) —

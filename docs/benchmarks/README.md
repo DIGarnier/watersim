@@ -15,11 +15,18 @@ Final report with baseline→final tables:
 | 13 | [13-bh-theta.md](13-bh-theta.md) | BH force-**sign fix** (attraction → repulsion, bug since BH introduction) + measured θ, default 0.5 → 0.9 | 2.2× cheaper traversal at 6 % measured force error |
 | 14 | [14-mts-farfield.md](14-mts-farfield.md) | multiple time stepping (r-RESPA): far field every 4 substeps, contacts every substep | −55…−66 % BH-path step; −17…−28 % grid paths; contact quality unchanged |
 | 15 | [15-solver-relaxation.md](15-solver-relaxation.md) | solver iterations 4 → 3, SOR ω measured on both engines | −18/−32 % solver time at reference quality; ω ≥ 1.5 unsafe on Jacobi engine |
+| 16 | [16-second-pass-report.md](16-second-pass-report.md) | — (report for stages 12–15) | BH path 2.5–4.2×, real-time through 12k (was 3k) |
+| 17 | [17-smaller-particles.md](17-smaller-particles.md) | smaller particulates: BALL_SIZE 4 → 3 | 24k scenario no longer over-fills: max pen 100 % → 0–0.5 % on grid paths; mid sizes −15…−35 % pending stage 19 |
+| 18 | [18-engine-crossover.md](18-engine-crossover.md) | re-swept serial↔packed solver threshold | PAR_MIN_PARTICLES 16k → 22k (crossover moved with the new cost profile) |
+| 19 | [19-grid-retune.md](19-grid-retune.md) | grid cell 10 → 7.5 px (= contact + skin) | stencil candidates ×0.56: grid paths −25…−29 % at 12–24k |
 
-Net (mean µs/step, defaults, same-day A/B): BH path 2.5–4.2× faster and
-real-time through **12 000** particles (was 3 000); grid paths ~1.4× faster
-at solver-dominated sizes. New harness modes: `--force-error`, `--sweep`
-(quality metrics + chaos-floor control), `--soak`.
+Net (mean µs/step, defaults, same-day A/B chains): BH path 2.5–4.2× faster;
+grid paths ~1.4× at solver-dominated sizes, then another ~1.3× from stages
+17+19 at equal physics quality. **Every path holds the 480 Hz median budget
+through 24 000 particles** (at pass start: no path at 24k, BH fell off at
+6k; BH at 24k is median-real-time — its MTS refresh spikes amortize across
+the frame, mean 3.7 ms). New harness modes: `--force-error`, `--sweep`
+(quality metrics + chaos-floor control), `--engine-sweep`, `--soak`.
 
 ## First pass — 2026-07-01 (data structures & parallelism)
 

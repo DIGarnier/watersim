@@ -59,12 +59,14 @@ const SOLVER_ITERATIONS: usize = 3;
 const SOLVER_OMEGA: f32 = 1.0;
 
 // Below this particle count the serial grid paths win (rayon region overhead
-// dominates small workloads). Re-tuned for the packed Jacobi engine, which
-// runs only 5 parallel regions per step (1 force pass + 4 solver iterations);
-// see docs/benchmarks/10-packed-simd-jacobi.md for the sweep. The Barnes-Hut
-// traversal has no threshold: it is one region of heavy independent work and
-// wins at every tested size.
-const PAR_MIN_PARTICLES: usize = 16_000;
+// dominates small workloads). Originally 16k (docs/benchmarks/10); re-swept
+// after MTS + 3 iterations + smaller particles changed the packed engine's
+// cost profile (docs/benchmarks/18-engine-crossover.md): packed now wins at
+// ~16-20k on spatial-hash but only ~24k on verlet-lists, margins within the
+// VM noise band, so the single threshold sits between. Runtime-tunable via
+// `set_par_min_particles`. The Barnes-Hut traversal has no threshold: it is
+// one region of heavy independent work and wins at every tested size.
+const PAR_MIN_PARTICLES: usize = 22_000;
 
 const LEFT_WALL: f32 = 0.;
 const RIGHT_WALL: f32 = WIDTH;
@@ -622,6 +624,7 @@ pub struct Physics {
     force_interval: usize,
     solver_iterations: usize,
     solver_omega: f32,
+    par_min: usize,
 
     // Performance tracking
     last_max_velocity: f32,
@@ -660,6 +663,7 @@ impl Physics {
             force_interval: FORCE_INTERVAL,
             solver_iterations: SOLVER_ITERATIONS,
             solver_omega: SOLVER_OMEGA,
+            par_min: PAR_MIN_PARTICLES,
             last_max_velocity: 0.0,
         }
     }
@@ -684,6 +688,13 @@ impl Physics {
     /// Contact-solver over-relaxation factor (1.0 = historical behavior).
     pub fn set_solver_omega(&mut self, omega: f32) {
         self.solver_omega = omega;
+    }
+
+    /// Particle count at which the grid paths switch from the serial
+    /// Gauss-Seidel engine to the packed parallel Jacobi engine
+    /// (0 = always packed, usize::MAX = always serial).
+    pub fn set_par_min_particles(&mut self, par_min: usize) {
+        self.par_min = par_min;
     }
 
     pub fn step(&mut self, dt: f32, share: &mut ShareData) {
@@ -821,7 +832,7 @@ impl Physics {
         // At scale, the packed Jacobi engine wins: positions packed once into
         // CSR-ordered SoA, gathers are order-independent, and a step needs
         // only 5 parallel regions instead of 24 colored ones.
-        let packed = c_pos.len() >= PAR_MIN_PARTICLES;
+        let packed = c_pos.len() >= self.par_min;
         if packed {
             self.pack_positions(c_pos);
         }
@@ -1016,7 +1027,7 @@ impl Physics {
     }
 
     fn compute_forces_with_verlet_lists(&mut self, c_pos: &[Vec2]) {
-        if c_pos.len() >= PAR_MIN_PARTICLES {
+        if c_pos.len() >= self.par_min {
             // Parallel gather: each particle sums its full (symmetric) neighbor
             // list, so no cross-thread writes. Twice the arithmetic of the
             // Newton's-third-law scatter, but it parallelizes cleanly.
@@ -1044,7 +1055,7 @@ impl Physics {
 
     fn compute_forces_with_spatial_hash(&mut self, c_pos: &[Vec2]) {
         let n = c_pos.len();
-        if n >= PAR_MIN_PARTICLES {
+        if n >= self.par_min {
             // Packed parallel gather over the CSR-ordered SoA arrays.
             let s8 = self.scale / 8.0;
             self.acc_x.clear();

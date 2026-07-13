@@ -41,6 +41,7 @@ struct Knobs {
     fint: usize, // far-field force refresh interval (substeps)
     iters: usize,
     omega: f32,
+    par_min: Option<usize>, // None = engine default crossover
 }
 
 /// The configuration this optimization pass started from (stage-11 behavior):
@@ -50,6 +51,18 @@ const REF_KNOBS: Knobs = Knobs {
     fint: 1,
     iters: 4,
     omega: 1.0,
+    par_min: None,
+};
+
+/// The defaults adopted at the end of the pass (stages 13–15) — keep in sync
+/// with the constants in physics.rs. Used by sweeps that pin everything but
+/// the knob under study.
+const ADOPTED_KNOBS: Knobs = Knobs {
+    theta: 0.9,
+    fint: 4,
+    iters: 3,
+    omega: 1.0,
+    par_min: None,
 };
 
 struct RunResult {
@@ -205,6 +218,9 @@ fn run_opts(
         physics.set_force_interval(k.fint);
         physics.set_solver_iterations(k.iters);
         physics.set_solver_omega(k.omega);
+        if let Some(pm) = k.par_min {
+            physics.set_par_min_particles(pm);
+        }
     };
     if let Some(k) = warmup_knobs {
         apply(&mut physics, k);
@@ -317,6 +333,38 @@ fn force_error_mode() {
     }
 }
 
+/// Serial Gauss-Seidel vs packed Jacobi engine crossover: run the grid paths
+/// at several sizes with the engine forced each way (everything else at the
+/// adopted defaults) to locate where the packed engine starts winning —
+/// PAR_MIN_PARTICLES. Re-run whenever the per-step cost profile changes.
+fn engine_sweep_mode() {
+    println!("| particles | path | serial mean µs | packed mean µs | packed wins? |");
+    println!("|---|---|---|---|---|");
+    for &n in &[8_000usize, 12_000, 16_000, 20_000, 24_000] {
+        for path in [ForcePath::VerletLists, ForcePath::SpatialHash] {
+            let run = |pm: usize| {
+                run_config(
+                    n,
+                    150,
+                    30,
+                    path,
+                    Some(Knobs { par_min: Some(pm), ..ADOPTED_KNOBS }),
+                )
+            };
+            let serial = run(usize::MAX);
+            let packed = run(0);
+            println!(
+                "| {} | {} | {:.0} | {:.0} | {} |",
+                n,
+                path.label(),
+                serial.mean_us,
+                packed.mean_us,
+                if packed.mean_us < serial.mean_us { "yes" } else { "no" },
+            );
+        }
+    }
+}
+
 /// Long-horizon stability check of the engine's adopted defaults: 2400 steps
 /// (5 s simulated), sanity + contact quality at the end. Guards against slow
 /// degradation modes (creeping penetration, drift into walls, NaN) that the
@@ -367,11 +415,11 @@ fn sweep_mode() {
         ("θ=0.9 K=8", Knobs { theta: 0.9, fint: 8, ..REF_KNOBS }),
         (
             "combo-safe θ=0.9 K=4 it=3 ω=1.0",
-            Knobs { theta: 0.9, fint: 4, iters: 3, omega: 1.0 },
+            Knobs { theta: 0.9, fint: 4, iters: 3, omega: 1.0, ..REF_KNOBS },
         ),
         (
             "combo-fast θ=0.9 K=4 it=2 ω=1.25",
-            Knobs { theta: 0.9, fint: 4, iters: 2, omega: 1.25 },
+            Knobs { theta: 0.9, fint: 4, iters: 2, omega: 1.25, ..REF_KNOBS },
         ),
     ];
     let grid_variants: &[(&str, Knobs)] = &[
@@ -464,6 +512,10 @@ fn main() {
     }
     if std::env::args().any(|a| a == "--soak") {
         soak_mode();
+        return;
+    }
+    if std::env::args().any(|a| a == "--engine-sweep") {
+        engine_sweep_mode();
         return;
     }
     if phases {
