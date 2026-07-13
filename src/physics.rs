@@ -26,14 +26,37 @@ const REORDER_INTERVAL: usize = 64;
 const ADAPTIVE_DT_MIN: f32 = PHYS_TIME_STEP * 0.1;
 const ADAPTIVE_DT_MAX: f32 = PHYS_TIME_STEP * 2.0;
 const MAX_SAFE_VELOCITY: f32 = 100.0; // Reduce dt when velocities exceed this
-const BARNES_HUT_THETA: f32 = 0.5; // Barnes-Hut approximation parameter
+
+// Barnes-Hut opening angle. Monopole force error grows ~θ²; the sweep in
+// docs/benchmarks/13-bh-theta.md measured the actual error/speed curve for
+// this sim and picked the default. Runtime-tunable via `set_bh_theta`.
+const BARNES_HUT_THETA: f32 = 0.9;
+
+// Far-field force refresh interval, in substeps (RESPA-style multiple time
+// stepping; Tuckerman, Berne & Martyna 1992, docs/literature.md §7). The
+// repulsion field is smooth and positions move a tiny fraction of a cell per
+// 480 Hz substep, so the expensive force pass (BH tree or grid gather) is
+// recomputed only every K substeps and reused in between. The contact solver
+// — the fast, stiff part — still runs every substep. Quality was measured in
+// docs/benchmarks/14-mts-farfield.md. Runtime-tunable via
+// `set_force_interval`; 1 = recompute every substep (old behavior).
+const FORCE_INTERVAL: usize = 4;
 
 // Constraint-projection iterations per substep. The sim already substeps at
 // 480 Hz (8 substeps per 60 Hz visual frame); per "Small Steps in Physics
 // Simulation" (Macklin et al., SCA 2019) substeps are far more valuable than
 // solver iterations, so a small count here suffices (see
 // docs/benchmarks/04-small-steps.md for the measured speed/quality trade).
-const SOLVER_ITERATIONS: usize = 4;
+const SOLVER_ITERATIONS: usize = 3;
+
+// Over-relaxation factor for the contact projection (SOR; Macklin et al.,
+// "Unified Particle Physics for Real-Time Applications" recommend 1 ≤ ω ≤ 2
+// for Jacobi/Gauss-Seidel constraint solvers). ω = 1 reproduces the
+// historical 0.375-per-half correction. The measured (iterations × ω)
+// surface lives in docs/benchmarks/15-solver-relaxation.md: 3 iterations at
+// ω = 1 keep stage-11 contact quality at ~-20% solver cost; ω ≈ 1.25 at 2
+// iterations is the faster/mushier point, ω ≥ 1.5 overshoots.
+const SOLVER_OMEGA: f32 = 1.0;
 
 // Below this particle count the serial grid paths win (rayon region overhead
 // dominates small workloads). Re-tuned for the packed Jacobi engine, which
@@ -290,7 +313,11 @@ impl BhTree {
                 continue;
             }
 
-            let diff = n.center_of_mass - pos;
+            // Repulsion, matching the exact pair kernel `force()`: diff points
+            // from the aggregate mass toward the particle. (The original BH
+            // code had this inverted — attraction — so toggling BH silently
+            // simulated a different system; see docs/benchmarks/13-bh-theta.md.)
+            let diff = pos - n.center_of_mass;
             let dist_sq = diff.length_squared();
 
             // size/dist < theta  <=>  size² < theta²·dist², sqrt-free
@@ -322,8 +349,8 @@ impl BhTree {
                 let start = n.leaf_start as usize;
                 let end = start + n.leaf_count as usize;
                 for k in start..end {
-                    let dx = self.leaf_x[k] - pos.x;
-                    let dy = self.leaf_y[k] - pos.y;
+                    let dx = pos.x - self.leaf_x[k];
+                    let dy = pos.y - self.leaf_y[k];
                     let d2 = dx * dx + dy * dy;
                     let m = if d2 >= BALL_SQ { 1.0f32 } else { 0.0 };
                     // active pairs have d2 ≥ BALL² > 1, so max(d2,1) == d2c
@@ -533,6 +560,7 @@ fn gather_correction(
     px: &[f32],
     py: &[f32],
     rows: &[(usize, usize); 3],
+    relax: f32,
 ) -> (f32, f32) {
     const CONTACT: f32 = BALL_SIZE + BALL_SIZE;
     let mut cx = 0.0f32;
@@ -552,8 +580,9 @@ fn gather_correction(
             let d2c = d2.max(1e-12);
             let inv = 1.0 / d2c.sqrt();
             let dist = d2c * inv;
-            // == normalized(axis) * 0.75 * (dist - CONTACT) / 2, masked
-            let term = m * 0.375 * (dist - CONTACT) * inv;
+            // == normalized(axis) * relax * (dist - CONTACT), masked;
+            // relax = 0.375·ω (ω = 1 reproduces the historical factor)
+            let term = m * relax * (dist - CONTACT) * inv;
             cx -= dx * term;
             cy -= dy * term;
         }
@@ -581,11 +610,18 @@ pub struct Physics {
     acc_x: Vec<f32>,
     acc_y: Vec<f32>,
     packed_cell: Vec<u32>,
+    // Cached far-field forces for multiple time stepping: refreshed every
+    // `force_interval` substeps, reused in between (empty = no valid cache).
+    c_farfield: Vec<Vec2>,
     frame_count: usize,
     use_barnes_hut: bool,
     use_verlet_lists: bool,
     use_adaptive_dt: bool,
     adaptive_dt: f32,
+    bh_theta: f32,
+    force_interval: usize,
+    solver_iterations: usize,
+    solver_omega: f32,
 
     // Performance tracking
     last_max_velocity: f32,
@@ -614,13 +650,40 @@ impl Physics {
             acc_x: Vec::new(),
             acc_y: Vec::new(),
             packed_cell: Vec::new(),
+            c_farfield: Vec::new(),
             frame_count: 0,
             use_barnes_hut: true,  // Enable Barnes-Hut by default
             use_verlet_lists: true, // Enable Verlet lists by default
             use_adaptive_dt: true,  // Enable adaptive time-stepping by default
             adaptive_dt: PHYS_TIME_STEP,
+            bh_theta: BARNES_HUT_THETA,
+            force_interval: FORCE_INTERVAL,
+            solver_iterations: SOLVER_ITERATIONS,
+            solver_omega: SOLVER_OMEGA,
             last_max_velocity: 0.0,
         }
+    }
+
+    /// Barnes-Hut opening angle (accuracy/speed knob; error ~ θ²).
+    pub fn set_bh_theta(&mut self, theta: f32) {
+        self.bh_theta = theta;
+    }
+
+    /// Far-field force refresh interval in substeps (1 = every substep).
+    /// Invalidates the cache so the new cadence starts with fresh forces.
+    pub fn set_force_interval(&mut self, interval: usize) {
+        self.force_interval = interval.max(1);
+        self.c_farfield.clear();
+    }
+
+    /// Contact-solver iterations per substep.
+    pub fn set_solver_iterations(&mut self, iterations: usize) {
+        self.solver_iterations = iterations.max(1);
+    }
+
+    /// Contact-solver over-relaxation factor (1.0 = historical behavior).
+    pub fn set_solver_omega(&mut self, omega: f32) {
+        self.solver_omega = omega;
     }
 
     pub fn step(&mut self, dt: f32, share: &mut ShareData) {
@@ -722,6 +785,9 @@ impl Physics {
         permute_v2(&mut share.c_pos, &mut self.scratch_v2);
         permute_v2(&mut self.c_opos, &mut self.scratch_v2);
         permute_v2(&mut self.c_force, &mut self.scratch_v2);
+        if self.c_farfield.len() == n {
+            permute_v2(&mut self.c_farfield, &mut self.scratch_v2);
+        }
 
         self.scratch_f.clear();
         self.scratch_f
@@ -760,25 +826,42 @@ impl Physics {
             self.pack_positions(c_pos);
         }
 
-        // Use Barnes-Hut for force calculation if enabled
+        // Far-field forces with multiple time stepping (RESPA-style): the
+        // smooth long-range repulsion is refreshed every `force_interval`
+        // substeps and held piecewise-constant in between; only the stiff
+        // contact projection below runs every substep. A cache-length
+        // mismatch (new particles fired in) forces a refresh.
         let t = Instant::now();
-        if self.use_barnes_hut {
-            self.compute_forces_barnes_hut(c_pos, stats);
+        let refresh = self.force_interval <= 1
+            || self.c_farfield.len() != c_pos.len()
+            || self.frame_count % self.force_interval == 0;
+        if refresh {
+            if self.use_barnes_hut {
+                self.compute_forces_barnes_hut(c_pos, stats);
+            } else {
+                self.compute_forces_naive(c_pos);
+            }
+            if self.force_interval > 1 {
+                self.c_farfield.clear();
+                self.c_farfield.extend_from_slice(&self.c_force);
+            }
         } else {
-            self.compute_forces_naive(c_pos);
+            // Reuse the cached field (integrate() zeroed c_force).
+            self.c_force.copy_from_slice(&self.c_farfield);
+            stats.tree_build_time_us = 0;
         }
         stats.force_calc_time_us = t.elapsed().as_micros() as u64;
 
         // Handle collisions using constraint solver
         let t = Instant::now();
         if packed {
-            for _ in 0..SOLVER_ITERATIONS {
+            for _ in 0..self.solver_iterations {
                 self.resolve_collisions_packed();
                 self.check_wall_collisions_packed();
             }
             self.scatter_positions(c_pos);
         } else {
-            for _ in 0..SOLVER_ITERATIONS {
+            for _ in 0..self.solver_iterations {
                 self.resolve_collisions_serial(c_pos);
                 self.check_wall_collisions_serial(c_pos);
             }
@@ -805,9 +888,8 @@ impl Physics {
         }
     }
 
-    fn compute_forces_barnes_hut(&mut self, c_pos: &[Vec2], stats: &mut PerformanceStats) {
-        // Rebuild the arena tree (capacity persists across frames)
-        let t = Instant::now();
+    /// Rebuild the arena tree (capacity persists across frames).
+    fn build_bh_tree(&mut self, c_pos: &[Vec2]) {
         let bounds = AABB::new(
             Vec2::new(LEFT_WALL, BOTTOM_WALL),
             Vec2::new(RIGHT_WALL, TOP_WALL),
@@ -821,21 +903,54 @@ impl Physics {
                 .insert(i as u32, pos.clamp(bounds.min, bounds.max), 1.0);
         }
         self.bh_tree.finalize();
+    }
+
+    fn compute_forces_barnes_hut(&mut self, c_pos: &[Vec2], stats: &mut PerformanceStats) {
+        let t = Instant::now();
+        self.build_bh_tree(c_pos);
         stats.tree_build_time_us = t.elapsed().as_micros() as u64;
         stats.tree_node_count = self.bh_tree.hot.len();
 
         // Independent read-only traversals: parallelize over particles with a
         // per-thread scratch stack.
-        let (tree, scale) = (&self.bh_tree, self.scale);
+        let (tree, scale, theta) = (&self.bh_tree, self.scale, self.bh_theta);
         self.c_force
             .par_iter_mut()
             .enumerate()
             .for_each_init(
                 || Vec::with_capacity(256),
                 |stack, (i, f)| {
-                    *f += tree.compute_force(c_pos[i], scale, BARNES_HUT_THETA, stack) / 8.0;
+                    *f += tree.compute_force(c_pos[i], scale, theta, stack) / 8.0;
                 },
             );
+    }
+
+    /// Bench/test hook: Barnes-Hut forces for `positions` at an explicit θ,
+    /// same scaling as the engine's force pass. Not used by the sim loop.
+    pub fn forces_barnes_hut_at(&mut self, positions: &[Vec2], theta: f32) -> Vec<Vec2> {
+        self.build_bh_tree(positions);
+        let (tree, scale) = (&self.bh_tree, self.scale);
+        let mut stack = Vec::with_capacity(256);
+        positions
+            .iter()
+            .map(|&p| tree.compute_force(p, scale, theta, &mut stack) / 8.0)
+            .collect()
+    }
+
+    /// Bench/test hook: exact O(n²) pairwise forces with the engine's kernel
+    /// and scaling — the ground truth the tree approximates.
+    pub fn forces_direct(&self, positions: &[Vec2]) -> Vec<Vec2> {
+        let scale = self.scale;
+        positions
+            .par_iter()
+            .map(|&pi| {
+                let mut acc = Vec2::ZERO;
+                for &pj in positions {
+                    acc += force(pi, pj, scale);
+                }
+                acc / 8.0
+            })
+            .collect()
     }
 
     fn compute_forces_naive(&mut self, c_pos: &[Vec2]) {
@@ -999,7 +1114,7 @@ impl Physics {
     /// the common non-overlapping case — callers skip the position stores
     /// entirely then. One rsqrt replaces length() + try_normalize().
     #[inline(always)]
-    fn pair_correction(pos_a: Vec2, pos_b: Vec2) -> Option<Vec2> {
+    fn pair_correction(pos_a: Vec2, pos_b: Vec2, relax: f32) -> Option<Vec2> {
         const CONTACT: f32 = BALL_SIZE + BALL_SIZE;
         let col_axis = pos_a - pos_b;
         let dist_sq = col_axis.length_squared();
@@ -1009,13 +1124,14 @@ impl Physics {
         }
         let inv_dist = fast_rsqrt(dist_sq);
         let dist = dist_sq * inv_dist;
-        // == normalized(col_axis) * 0.75 * (dist - CONTACT) / 2
-        Some(col_axis * (inv_dist * 0.375 * (dist - CONTACT)))
+        // == normalized(col_axis) * relax * (dist - CONTACT), where
+        // relax = 0.375·ω (ω = 1 reproduces the historical 0.75/2 factor)
+        Some(col_axis * (inv_dist * relax * (dist - CONTACT)))
     }
 
     #[inline(always)]
-    fn project_pair(c_pos: &mut [Vec2], i: usize, j: usize) {
-        if let Some(corr) = Self::pair_correction(c_pos[i], c_pos[j]) {
+    fn project_pair(c_pos: &mut [Vec2], i: usize, j: usize, relax: f32) {
+        if let Some(corr) = Self::pair_correction(c_pos[i], c_pos[j], relax) {
             c_pos[i] -= corr;
             c_pos[j] += corr;
         }
@@ -1024,6 +1140,7 @@ impl Physics {
     /// Gauss-Seidel sweep over occupied cells (forward half-stencil, each
     /// unordered cell pair once). Fastest engine at serial particle counts.
     fn resolve_collisions_serial(&mut self, c_pos: &mut [Vec2]) {
+        let relax = 0.375 * self.solver_omega;
         for oc in 0..self.grid.occupied.len() {
             let cell = self.grid.occupied[oc] as usize;
             let (x, y) = (cell % GRID_W, cell / GRID_W);
@@ -1032,7 +1149,7 @@ impl Physics {
             for a in 0..currents.len() {
                 let i = currents[a] as usize;
                 for b in a + 1..currents.len() {
-                    Self::project_pair(c_pos, i, currents[b] as usize);
+                    Self::project_pair(c_pos, i, currents[b] as usize, relax);
                 }
             }
 
@@ -1043,7 +1160,7 @@ impl Physics {
                 }
                 for &i in currents {
                     for &j in self.grid.cell(ny as usize * GRID_W + nx as usize) {
-                        Self::project_pair(c_pos, i as usize, j as usize);
+                        Self::project_pair(c_pos, i as usize, j as usize, relax);
                     }
                 }
             }
@@ -1080,6 +1197,7 @@ impl Physics {
         self.acc_y.resize(n, 0.0);
 
         {
+            let relax = 0.375 * self.solver_omega;
             let (grid, px, py, cells) = (&self.grid, &self.px, &self.py, &self.packed_cell);
             let (acc_x, acc_y) = (&mut self.acc_x, &mut self.acc_y);
             acc_x
@@ -1088,7 +1206,7 @@ impl Physics {
                 .enumerate()
                 .for_each(|(k, (cx, cy))| {
                     let rows = stencil_rows(&grid.cell_start, cells[k] as usize);
-                    let (gx, gy) = gather_correction(px[k], py[k], px, py, &rows);
+                    let (gx, gy) = gather_correction(px[k], py[k], px, py, &rows, relax);
                     *cx = gx;
                     *cy = gy;
                 });
