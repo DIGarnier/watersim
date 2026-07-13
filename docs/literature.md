@@ -78,6 +78,85 @@ machines.
 **Applies here:** physics runs on one thread; the machine has 4 cores. Use `rayon`
 for the force gather and integration loops.
 
+---
+
+Sections below added 2026-07-13 for the second optimization pass
+(docs/benchmarks/12+), focused on *controlled* accuracy/speed trades — the
+realtime-vs-accuracy compromise knobs used across water/particle simulation
+practice.
+
+## 6. Barnes-Hut opening angle: error is a dial, not a constant
+
+The multipole acceptance criterion s/d < θ makes θ the canonical
+accuracy/cost dial of treecodes: monopole-only force error grows ~θ² for
+near-uniform distributions, and traversal cost falls roughly as 1/θ².
+Production astrophysics codes run θ = 0.7–1.0 and report the *measured* rms
+force error rather than assuming one.
+
+- Barnes & Hut, *A hierarchical O(N log N) force-calculation algorithm*, Nature 324 (1986).
+- Wadsley, Stadel & Quinn, *Gasoline: an adaptable implementation of TreeSPH*
+  ([arXiv:astro-ph/0303521](https://arxiv.org/pdf/astro-ph/0303521)) — θ = 0.7 typical,
+  rms relative force error ~0.4% reported for clustered states.
+- Interactive error/cost exploration: [The Barnes-Hut Approximation (Heer)](https://jheer.github.io/barnes-hut/) —
+  θ ≈ 1 gives ~1% errors for gravity benchmarks.
+
+**Applies here:** θ was hard-coded at 0.5 with no error measurement. The bench
+now has a `--force-error` mode comparing tree forces against the exact O(n²)
+sum; docs/benchmarks/13-bh-theta.md has the measured curve for this sim
+(error ≈ 1.3% at θ=0.5, 6% at θ=0.9; traversal 2.2× faster at 0.9). Also
+uncovered by that instrument: the BH traversal had the force *sign inverted*
+relative to every exact path since its introduction (rel. RMS "error" of 2.0
+at all θ = a flipped vector). Fixed; BH now approximates the same repulsive
+system the exact paths compute.
+
+## 7. Multiple time stepping (r-RESPA): slow forces on a slow clock
+
+For systems with a stiffness separation — fast local interactions, smooth
+long-range field — evaluating the long-range force every n substeps and
+holding it in between is the classic MD answer, formally derived from a
+Trotter factorization (reversible, stable):
+
+- Tuckerman, Berne & Martyna, *Reversible multiple time scale molecular
+  dynamics*, J. Chem. Phys. 97, 1990 (1992) —
+  [PDF](https://www.columbia.edu/cu/chemistry/groups/berne/papers/jcp_97_1990_1992.pdf):
+  "the short range force is computed after each time step and the long range
+  force is computed every n time steps", with "considerable speedups … with
+  no loss of accuracy".
+- Games/graphics land routinely does the same thing as "force caching" /
+  staggered updates; Small Steps (Macklin et al. 2019, §2 above) is the
+  complementary result that the *constraint* part wants the fastest clock.
+
+**Applies here:** the sim substeps at 480 Hz; per substep a particle moves a
+tiny fraction of a grid cell, so the smooth 1/r² repulsion field barely
+changes between substeps — yet it was recomputed (tree build + traversal, the
+dominant cost on the BH path) every substep. Now the far-field pass refreshes
+every K substeps (`FORCE_INTERVAL`, default 4) and is held piecewise-constant;
+the stiff contact projection still runs at 480 Hz, exactly the RESPA split.
+Measured in docs/benchmarks/14-mts-farfield.md.
+
+## 8. Constraint solver: over-relaxation instead of iterations
+
+Position-based solvers converge geometrically, so the per-pair correction
+factor and the iteration count are interchangeable currencies. PBD/PBF
+practice exposes an SOR factor ω (1 ≤ ω ≤ 2) on Jacobi/Gauss-Seidel constraint
+projection, with constraint averaging keeping Jacobi stable:
+
+- Macklin, Müller, Chentanez & Kim, *Unified Particle Physics for Real-Time
+  Applications*, SIGGRAPH 2014 —
+  [preprint](https://mmacklin.com/uppfrta_preprint.pdf): global SOR parameter,
+  1 ≤ ω ≤ 2 recommended.
+- Macklin & Müller, *Position Based Fluids*, SIGGRAPH 2013 — parallel Jacobi
+  density-constraint solver for realtime water, the framing this sim's
+  contact solver already follows at scale (stage 10).
+
+**Applies here:** the historical solver ran 4 iterations of an under-relaxed
+projection (0.75 stiffness, half per particle → effective per-pair factor
+0.375). The factor is now 0.375·ω with ω runtime-tunable; the measured
+(iterations × ω) surface (docs/benchmarks/15-solver-relaxation.md) shows
+where fewer, stronger iterations buy solver time at equal penetration
+quality — the solver dominates the grid paths, so this converts directly to
+step time.
+
 ## Sources
 
 - https://arxiv.org/pdf/2212.07679
