@@ -14,9 +14,17 @@ name = "lolballs"
 path = "src/main.rs"
 required-features = ["graphics"]
 
+# Headless comparison renderer (writes GIF/PNG). Off the default feature set so
+# neither the graphics build nor the headless CI build compiles it.
+[[bin]]
+name = "render"
+path = "src/bin/render.rs"
+required-features = ["render"]
+
 [features]
 default = ["graphics"]
 graphics = ["dep:ggez"]
+render = []
 
 [dependencies]
 glam = "0.24.1"
