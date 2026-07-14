@@ -768,7 +768,226 @@ fn debug_run() {
     }
 }
 
+/// Tuning harness: drop a block of fluid onto the floor and let it settle,
+/// then measure how *calm* it gets. Real water settles to still — residual
+/// mean/max speed should decay toward the granular resting level while the
+/// fluid stays incompressible (ρ/ρ0 ≈ 1) and doesn't clump. Sweeps the PBF
+/// coefficients that inject/damp energy (viscosity, vorticity, s_corr,
+/// per-iteration clamp) and prints a table so the calmest stable config wins.
+fn tune_mode() {
+    let s = 2.0 * BALL_SIZE;
+    // A block released above the floor: transient splash, then it should settle.
+    let mut positions = Vec::new();
+    for gy in 0..44 {
+        for gx in 0..70 {
+            positions.push(Vec2::new(
+                0.30 * WIDTH + gx as f32 * s,
+                0.20 * HEIGHT + gy as f32 * s,
+            ));
+        }
+    }
+    let n = positions.len();
+
+    // ε=1e-3 (softer density solve) did most of the calming; find the lowest
+    // viscosity that still settles so splashes stay lively.
+    let base = PbfParams {
+        vorticity: 0.0,
+        scorr_k: 3.0,
+        max_corr: 0.12 * 15.0,
+        eps_cfm: 1e-3,
+        ..PbfParams::default()
+    };
+    let configs: &[(&str, PbfParams)] = &[
+        (
+            "xsph=.05",
+            PbfParams {
+                xsph_c: 0.05,
+                ..base
+            },
+        ),
+        (
+            "xsph=.1",
+            PbfParams {
+                xsph_c: 0.1,
+                ..base
+            },
+        ),
+        (
+            "xsph=.15",
+            PbfParams {
+                xsph_c: 0.15,
+                ..base
+            },
+        ),
+        (
+            "xsph=.2",
+            PbfParams {
+                xsph_c: 0.2,
+                ..base
+            },
+        ),
+        (
+            "xsph=.1 eps=2e-3",
+            PbfParams {
+                xsph_c: 0.1,
+                eps_cfm: 2e-3,
+                ..base
+            },
+        ),
+        (
+            "xsph=.1 k=1.5",
+            PbfParams {
+                xsph_c: 0.1,
+                scorr_k: 1.5,
+                ..base
+            },
+        ),
+    ];
+
+    println!("| config | resid mean_spd | resid max_spd | rho/rho0 | clumped% | sane |");
+    println!("|---|---|---|---|---|---|");
+    for (label, params) in configs {
+        let (_tx, rx) = channel();
+        let mut physics = Physics::new(positions.clone(), vec![Vec2::ZERO; n], rx, 2000.0);
+        physics.set_adaptive_dt(false);
+        physics.set_strategy(Strategy::Pbf);
+        physics.set_pbf_params(*params);
+        physics.set_gravity(Vec2::new(0.0, 5.0));
+        let mut share = ShareData {
+            c_pos: positions.clone(),
+            c_color: vec![0.0; n],
+            ..Default::default()
+        };
+        // 8 s total; average the residual energy over the final 1.5 s.
+        let total = 8 * 480;
+        let tail = total - 720;
+        let mut mean_acc = 0.0f64;
+        let mut max_acc = 0.0f64;
+        let mut cnt = 0usize;
+        for step in 0..total {
+            physics.step(PHYS_TIME_STEP, &mut share);
+            if step >= tail {
+                mean_acc += share.perf_stats.mean_speed as f64;
+                max_acc += share.perf_stats.max_speed as f64;
+                cnt += 1;
+            }
+        }
+        let p = &share.c_pos;
+        let mut clumped = 0usize;
+        for i in (0..n).step_by(7) {
+            let mut best = f32::INFINITY;
+            for j in 0..n {
+                if i != j {
+                    best = best.min((p[i] - p[j]).length_squared());
+                }
+            }
+            if best.sqrt() < 0.5 * s {
+                clumped += 1;
+            }
+        }
+        let sampled = (0..n).step_by(7).count();
+        let nan = p
+            .iter()
+            .filter(|q| !q.x.is_finite() || !q.y.is_finite())
+            .count();
+        let escaped = p
+            .iter()
+            .filter(|q| q.x < -1.0 || q.x > WIDTH + 1.0 || q.y < -1.0 || q.y > HEIGHT + 1.0)
+            .count();
+        println!(
+            "| {label} | {:.1} | {:.0} | {:.2} | {:.0}% | {} |",
+            mean_acc / cnt as f64,
+            max_acc / cnt as f64,
+            share.perf_stats.pbf_density_ratio,
+            100.0 * clumped as f64 / sampled as f64,
+            if nan == 0 && escaped == 0 {
+                "ok"
+            } else {
+                "BAD"
+            },
+        );
+    }
+}
+
+/// Settle a block under each of two PBF configs for `secs` seconds and write a
+/// side-by-side still, so "residual mean_speed ≈ 20" can be judged by eye:
+/// gentle slosh vs unphysical surface boiling.
+fn settle_still(secs: usize) {
+    let s = 2.0 * BALL_SIZE;
+    let mut positions = Vec::new();
+    for gy in 0..44 {
+        for gx in 0..70 {
+            positions.push(Vec2::new(
+                0.30 * WIDTH + gx as f32 * s,
+                0.20 * HEIGHT + gy as f32 * s,
+            ));
+        }
+    }
+    let n = positions.len();
+    // Left: the old energetic tuning (stiff ε, weak XSPH, vorticity on).
+    // Right: the new calm default.
+    let configs: [(&str, PbfParams); 2] = [
+        (
+            "PAF",
+            PbfParams {
+                eps_cfm: 1.0e-4,
+                scorr_k: 6.0,
+                xsph_c: 0.08,
+                vorticity: 0.0006,
+                max_corr: 0.25 * 15.0,
+                ..PbfParams::default()
+            },
+        ),
+        ("PBF", PbfParams::default()),
+    ];
+    let pal = build_palette();
+    let mut canvas = Canvas::new(CANVAS_W, CANVAS_H);
+    canvas.fill_rect(
+        MARGIN + PANEL_W + GAP / 2 - 1,
+        MARGIN,
+        2,
+        CANVAS_H - 2 * MARGIN,
+        PAL_DIV,
+    );
+    for (idx, (label, params)) in configs.iter().enumerate() {
+        let (_tx, rx) = channel();
+        let mut physics = Physics::new(positions.clone(), vec![Vec2::ZERO; n], rx, 2000.0);
+        physics.set_adaptive_dt(false);
+        physics.set_strategy(Strategy::Pbf);
+        physics.set_pbf_params(*params);
+        physics.set_gravity(Vec2::new(0.0, 5.0));
+        let mut share = ShareData {
+            c_pos: positions.clone(),
+            c_color: vec![0.0; n],
+            ..Default::default()
+        };
+        for _ in 0..secs * 480 {
+            physics.step(PHYS_TIME_STEP, &mut share);
+        }
+        let ox = MARGIN + idx * (PANEL_W + GAP);
+        draw_panel(&mut canvas, ox, MARGIN + TITLE_H, &share);
+        draw_text(&mut canvas, ox + 4, MARGIN + 4, label, 2, PAL_TEXT);
+        println!(
+            "{label}: mean_speed={:.1} max_speed={:.0} rho/rho0={:.2}",
+            share.perf_stats.mean_speed,
+            share.perf_stats.max_speed,
+            share.perf_stats.pbf_density_ratio
+        );
+    }
+    std::fs::create_dir_all("renders").unwrap();
+    png_write("renders/settle.png", CANVAS_W, CANVAS_H, &canvas.px, &pal);
+    println!("wrote renders/settle.png (settled {secs}s)");
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--settle-still") {
+        settle_still(8);
+        return;
+    }
+    if std::env::args().any(|a| a == "--tune") {
+        tune_mode();
+        return;
+    }
     if std::env::args().any(|a| a == "--gif-selftest") {
         gif_selftest();
         return;
