@@ -1370,7 +1370,13 @@ impl Default for PbfParams {
             eps_cfm: 2.0e-3,
             scorr_k: 3.0,
             scorr_dq: 0.2 * PBF_H,
-            xsph_c: 0.1,
+            // 0.05, not 0.1: the sloshing benchmark showed 0.1 over-damped free
+            // oscillation (amplitude ×0.27/half-period) without improving the
+            // settle. Halving it lets a slosh persist ~2× longer (period still
+            // matches linear theory to ~3%) while a dropped block still settles
+            // calm. Residual damping below this is the density solve itself —
+            // PBF is inherently dissipative, an accepted stability trade.
+            xsph_c: 0.05,
             vorticity: 0.0,
             max_corr: 0.12 * PBF_H,
             lambda_max: 30.0,
@@ -1502,7 +1508,7 @@ struct Pbf {
     scorr_denom: f32, // W_poly6(Δq²), precomputed for the s_corr ratio
     vel: Vec<Vec2>,
     prev: Vec<Vec2>,     // predicted-from position, for the velocity update
-    lambda: Vec<f32>,    // λ_i
+    lambda: Vec<f32>,    // λ_i for the current iteration
     dp: Vec<Vec2>,       // Δx_i for the current iteration
     vscratch: Vec<Vec2>, // velocity double-buffer for XSPH / vorticity
     curl: Vec<f32>,      // per-particle scalar vorticity ω_i

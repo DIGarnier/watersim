@@ -979,7 +979,413 @@ fn settle_still(secs: usize) {
     println!("wrote renders/settle.png (settled {secs}s)");
 }
 
+// ---------------------------------------------------------------------------
+// Literature validation: standard water-sim benchmarks with quantitative
+// expectations (not just eyeballing). Effective gravity matches the engine's
+// integrator scaling: a = g·(1/PHYS_TIME_STEP).
+// ---------------------------------------------------------------------------
+
+fn a_eff(g_y: f32) -> f32 {
+    g_y / PHYS_TIME_STEP
+}
+
+fn verdict(pass: bool) -> &'static str {
+    if pass {
+        "PASS"
+    } else {
+        "FAIL"
+    }
+}
+
+fn new_pbf(positions: &[Vec2]) -> (Physics, ShareData) {
+    let n = positions.len();
+    let (tx, rx) = channel();
+    let mut physics = Physics::new(positions.to_vec(), vec![Vec2::ZERO; n], rx, 2000.0);
+    physics.set_adaptive_dt(false);
+    physics.set_strategy(Strategy::Pbf);
+    std::mem::forget(tx); // keep the channel endpoint alive for the run
+    let share = ShareData {
+        c_pos: positions.to_vec(),
+        c_color: vec![0.0; n],
+        ..Default::default()
+    };
+    (physics, share)
+}
+
+/// Occupied-cell footprint area (10 px bins) — an incompressibility proxy.
+fn footprint_area(p: &[Vec2]) -> f32 {
+    use std::collections::HashSet;
+    let mut cells = HashSet::new();
+    for q in p {
+        cells.insert(((q.x / 10.0) as i32, (q.y / 10.0) as i32));
+    }
+    cells.len() as f32 * 100.0
+}
+
+/// Test 1 — Hydrostatic tank (SPHERIC-style rest test). A block of fluid at
+/// rest must stay still, keep a flat free surface, and conserve volume
+/// (incompressibility). We validate these *observable* properties rather than
+/// the internal pressure field: PBF's raw λ is corrupted near boundaries by
+/// SPH particle deficiency (surface and floor particles have missing
+/// neighbors), so it does not read cleanly hydrostatic — a well-documented SPH
+/// artifact, separate from whether the tank behaves correctly, which it does.
+fn hydrostatic_test() {
+    println!("\n## Test 1: Hydrostatic tank (rest, flat surface, volume)");
+    let s = 2.0 * BALL_SIZE;
+    let g_y = 5.0;
+    let (x0, x1) = (0.15 * WIDTH, 0.85 * WIDTH);
+    let depth = 260.0;
+    let (yb, yt) = (HEIGHT - BALL_SIZE, HEIGHT - BALL_SIZE - depth);
+    let mut positions = Vec::new();
+    let mut y = yt;
+    while y <= yb {
+        let mut x = x0;
+        while x <= x1 {
+            positions.push(Vec2::new(x, y));
+            x += s;
+        }
+        y += s;
+    }
+    let (mut physics, mut share) = new_pbf(&positions);
+    physics.set_gravity(Vec2::new(0.0, g_y));
+
+    let area0 = footprint_area(&share.c_pos);
+    for _ in 0..3 * 480 {
+        physics.step(PHYS_TIME_STEP, &mut share);
+    }
+    let resid = share.perf_stats.mean_speed;
+    let area = footprint_area(&share.c_pos);
+    let area_drift = 100.0 * (area / area0 - 1.0);
+
+    // surface flatness: min-y (top surface) per x-column
+    let nb = 24usize;
+    let mut surf = vec![f32::INFINITY; nb];
+    for q in &share.c_pos {
+        let b = (((q.x - x0) / (x1 - x0)) * nb as f32) as usize;
+        if b < nb {
+            surf[b] = surf[b].min(q.y);
+        }
+    }
+    let surf: Vec<f32> = surf.into_iter().filter(|v| v.is_finite()).collect();
+    let smean = surf.iter().sum::<f32>() / surf.len() as f32;
+    let srms = (surf.iter().map(|v| (v - smean).powi(2)).sum::<f32>() / surf.len() as f32).sqrt();
+
+    let flat_ok = srms < 1.5 * s;
+    let area_ok = area_drift.abs() < 5.0;
+    let still_ok = resid < 5.0;
+    println!(
+        "  residual mean speed : {resid:.1}                 {}",
+        verdict(still_ok)
+    );
+    println!(
+        "  surface RMS         : {srms:.1} px (want <{:.0}) {}",
+        1.5 * s,
+        verdict(flat_ok)
+    );
+    println!(
+        "  volume drift        : {area_drift:+.1}%              {}",
+        verdict(area_ok)
+    );
+}
+
+/// Test 2 — Dam break (Koshizuka & Oka 1996 / Martin & Moyce 1952). A column
+/// of width a and height 2a collapses on a dry bed. Compare the surge-front
+/// speed to the analytical Ritter dry-bed tip speed 2√(gH), and confirm the
+/// front reaches the far wall while volume is conserved.
+fn dam_break_test() {
+    println!("\n## Test 2: Dam break (surge front vs Ritter 2√(gH))");
+    let s = 2.0 * BALL_SIZE;
+    let g_y = 5.0;
+    let a = 260.0;
+    let h = 2.0 * a; // classic aspect ratio 2
+    let (x0, x1) = (BALL_SIZE, BALL_SIZE + a);
+    let (yb, yt) = (HEIGHT - BALL_SIZE, HEIGHT - BALL_SIZE - h);
+    let mut positions = Vec::new();
+    let mut y = yt;
+    while y <= yb {
+        let mut x = x0;
+        while x <= x1 {
+            positions.push(Vec2::new(x, y));
+            x += s;
+        }
+        y += s;
+    }
+    let (mut physics, mut share) = new_pbf(&positions);
+    physics.set_gravity(Vec2::new(0.0, g_y));
+
+    let area0 = footprint_area(&share.c_pos);
+    let ritter = 2.0 * (a_eff(g_y) * h).sqrt();
+    let mut prev_tip = x1;
+    let mut max_speed = 0.0f32;
+    let mut reached = false;
+    let frames = (3.0 * 480.0) as usize;
+    for k in 0..frames {
+        physics.step(PHYS_TIME_STEP, &mut share);
+        if k % 12 == 0 {
+            let tip = share.c_pos.iter().map(|q| q.x).fold(0.0, f32::max);
+            let v = (tip - prev_tip) / (12.0 * PHYS_TIME_STEP);
+            max_speed = max_speed.max(v);
+            prev_tip = tip;
+            if tip > 0.9 * WIDTH {
+                reached = true;
+            }
+        }
+    }
+    let area = footprint_area(&share.c_pos);
+    let area_drift = 100.0 * (area / area0 - 1.0);
+    let ratio = max_speed / ritter;
+
+    let ratio_ok = (0.3..=1.2).contains(&ratio);
+    let area_ok = area_drift.abs() < 8.0;
+    println!("  Ritter tip speed    : {ritter:.0} px/s");
+    println!(
+        "  measured front speed: {max_speed:.0} px/s (ratio {ratio:.2}) {}",
+        verdict(ratio_ok)
+    );
+    println!(
+        "  front reached wall  : {reached}                    {}",
+        verdict(reached)
+    );
+    println!(
+        "  volume drift        : {area_drift:+.1}%                {}",
+        verdict(area_ok)
+    );
+}
+
+/// Test 3 — Sloshing tank. A still layer is kicked and left to oscillate; the
+/// free-oscillation period is compared to linear potential theory
+/// T = 2π/√(g·k·tanh(k·h)) with the first mode k = π/L.
+fn sloshing_test() {
+    println!("\n## Test 3: Sloshing period vs linear theory");
+    let s = 2.0 * BALL_SIZE;
+    let g_y = 5.0;
+    let (x0, x1) = (BALL_SIZE, WIDTH - BALL_SIZE);
+    let l = x1 - x0;
+    let h = 200.0;
+    let (yb, yt) = (HEIGHT - BALL_SIZE, HEIGHT - BALL_SIZE - h);
+    let mut positions = Vec::new();
+    let mut y = yt;
+    while y <= yb {
+        let mut x = x0;
+        while x <= x1 {
+            positions.push(Vec2::new(x, y));
+            x += s;
+        }
+        y += s;
+    }
+    let (mut physics, mut share) = new_pbf(&positions);
+
+    physics.set_gravity(Vec2::new(0.0, g_y));
+    for _ in 0..2 * 480 {
+        physics.step(PHYS_TIME_STEP, &mut share);
+    }
+    // Gentle sideways kick → small-amplitude oscillation (linear regime).
+    physics.set_gravity(Vec2::new(0.22 * g_y, g_y));
+    for _ in 0..(0.3 * 480.0) as usize {
+        physics.step(PHYS_TIME_STEP, &mut share);
+    }
+    physics.set_gravity(Vec2::new(0.0, g_y));
+
+    let center = 0.5 * (x0 + x1);
+    let mut series = Vec::new();
+    let steps = (12.0 * 480.0) as usize;
+    for k in 0..steps {
+        physics.step(PHYS_TIME_STEP, &mut share);
+        if k % 8 == 0 {
+            let comx = share.c_pos.iter().map(|q| q.x).sum::<f32>() / share.c_pos.len() as f32;
+            series.push((k as f32 * PHYS_TIME_STEP, comx - center));
+        }
+    }
+    // Period from the first max→min half-oscillation (robust even under heavy
+    // damping, which leaves only ~one clear swing). Damping = |trough|/peak.
+    let (mut tmax, mut vmax) = (0.0f32, f32::MIN);
+    for &(t, v) in &series {
+        if v > vmax {
+            vmax = v;
+            tmax = t;
+        }
+    }
+    let (mut tmin, mut vmin) = (0.0f32, f32::MAX);
+    for &(t, v) in &series {
+        if t > tmax && v < vmin {
+            vmin = v;
+            tmin = t;
+        }
+    }
+    let t_meas = 2.0 * (tmin - tmax);
+    let damp = if vmax > 0.0 { -vmin / vmax } else { f32::NAN };
+
+    let k1 = std::f32::consts::PI / l;
+    let omega = (a_eff(g_y) * k1 * (k1 * h).tanh()).sqrt();
+    let t_theory = 2.0 * std::f32::consts::PI / omega;
+    let ratio = t_meas / t_theory;
+    let ok = ratio.is_finite() && (0.7..=1.35).contains(&ratio);
+    println!("  tank L={l:.0} px, depth h={h:.0} px, first mode k=π/L");
+    println!("  theory period       : {t_theory:.2} s");
+    println!(
+        "  measured period     : {t_meas:.2} s (ratio {ratio:.2}, peak {vmax:.0}px)  {}",
+        verdict(ok)
+    );
+    let damp_label = if damp > 0.6 {
+        "lightly damped — sloshes many times"
+    } else if damp > 0.38 {
+        "moderately damped — sloshes ~2–3 cycles"
+    } else {
+        "heavily damped — dies in ~1 cycle"
+    };
+    println!("  amp decay/half-period: ×{damp:.2}  ({damp_label})");
+}
+
+/// Independent check of the effective gravity a = g/PHYS_TIME_STEP by dropping
+/// a single (neighbour-free) particle, so the benchmark theory uses the right g.
+fn accel_check() {
+    let pos = vec![Vec2::new(0.5 * WIDTH, 80.0)];
+    let (mut ph, mut sh) = new_pbf(&pos);
+    ph.set_gravity(Vec2::new(0.0, 5.0));
+    let y0 = sh.c_pos[0].y;
+    let n = 240usize;
+    for _ in 0..n {
+        ph.step(PHYS_TIME_STEP, &mut sh);
+    }
+    let t = n as f32 * PHYS_TIME_STEP;
+    let measured = 2.0 * (sh.c_pos[0].y - y0) / (t * t);
+    println!(
+        "## Sanity: free-fall a_eff ≈ {measured:.0} px/s² (expected {:.0})",
+        a_eff(5.0)
+    );
+}
+
+/// Settle a dropped block and return residual mean-speed (calmness).
+fn settle_resid(params: PbfParams) -> f32 {
+    let s = 2.0 * BALL_SIZE;
+    let mut positions = Vec::new();
+    for gy in 0..40 {
+        for gx in 0..64 {
+            positions.push(Vec2::new(
+                0.30 * WIDTH + gx as f32 * s,
+                0.25 * HEIGHT + gy as f32 * s,
+            ));
+        }
+    }
+    let (mut ph, mut sh) = new_pbf(&positions);
+    ph.set_pbf_params(params);
+    ph.set_gravity(Vec2::new(0.0, 5.0));
+    for _ in 0..8 * 480 {
+        ph.step(PHYS_TIME_STEP, &mut sh);
+    }
+    sh.perf_stats.mean_speed
+}
+
+/// Kick a full-width layer and return (period ratio vs theory, per-half-period
+/// amplitude decay). Decay near 1 = lightly damped (sloshes many times).
+fn slosh_metrics(params: PbfParams) -> (f32, f32) {
+    let s = 2.0 * BALL_SIZE;
+    let g_y = 5.0;
+    let (x0, x1) = (BALL_SIZE, WIDTH - BALL_SIZE);
+    let (l, h) = (x1 - x0, 200.0);
+    let (yb, yt) = (HEIGHT - BALL_SIZE, HEIGHT - BALL_SIZE - h);
+    let mut positions = Vec::new();
+    let mut y = yt;
+    while y <= yb {
+        let mut x = x0;
+        while x <= x1 {
+            positions.push(Vec2::new(x, y));
+            x += s;
+        }
+        y += s;
+    }
+    let (mut ph, mut sh) = new_pbf(&positions);
+    ph.set_pbf_params(params);
+    ph.set_gravity(Vec2::new(0.0, g_y));
+    for _ in 0..2 * 480 {
+        ph.step(PHYS_TIME_STEP, &mut sh);
+    }
+    ph.set_gravity(Vec2::new(0.22 * g_y, g_y));
+    for _ in 0..(0.3 * 480.0) as usize {
+        ph.step(PHYS_TIME_STEP, &mut sh);
+    }
+    ph.set_gravity(Vec2::new(0.0, g_y));
+    let center = 0.5 * (x0 + x1);
+    let mut series = Vec::new();
+    for k in 0..(12.0 * 480.0) as usize {
+        ph.step(PHYS_TIME_STEP, &mut sh);
+        if k % 8 == 0 {
+            let c = sh.c_pos.iter().map(|q| q.x).sum::<f32>() / sh.c_pos.len() as f32;
+            series.push((k as f32 * PHYS_TIME_STEP, c - center));
+        }
+    }
+    let (mut tmax, mut vmax) = (0.0f32, f32::MIN);
+    for &(t, v) in &series {
+        if v > vmax {
+            vmax = v;
+            tmax = t;
+        }
+    }
+    let (mut tmin, mut vmin) = (0.0f32, f32::MAX);
+    for &(t, v) in &series {
+        if t > tmax && v < vmin {
+            vmin = v;
+            tmin = t;
+        }
+    }
+    let k1 = std::f32::consts::PI / l;
+    let omega = (a_eff(g_y) * k1 * (k1 * h).tanh()).sqrt();
+    let t_theory = 2.0 * std::f32::consts::PI / omega;
+    (2.0 * (tmin - tmax) / t_theory, -vmin / vmax)
+}
+
+/// Trade-off sweep: numerical damping (sloshing persistence) vs settling calm,
+/// over the coefficients that dissipate energy.
+fn damp_sweep() {
+    let b = PbfParams::default();
+    let cfgs: &[(&str, PbfParams)] = &[
+        ("default (xsph.1)", b),
+        ("xsph=.05", PbfParams { xsph_c: 0.05, ..b }),
+        ("xsph=.03", PbfParams { xsph_c: 0.03, ..b }),
+        ("xsph=.0", PbfParams { xsph_c: 0.0, ..b }),
+        (
+            "xsph=.03 corr=.2h",
+            PbfParams {
+                xsph_c: 0.03,
+                max_corr: 0.2 * 15.0,
+                ..b
+            },
+        ),
+        (
+            "xsph=.03 eps=1e-3",
+            PbfParams {
+                xsph_c: 0.03,
+                eps_cfm: 1e-3,
+                ..b
+            },
+        ),
+    ];
+    println!("| config | slosh period ratio | half-period decay | settle resid |");
+    println!("|---|---|---|---|");
+    for (name, p) in cfgs {
+        let (ratio, decay) = slosh_metrics(*p);
+        let resid = settle_resid(*p);
+        println!("| {name} | {ratio:.2} | ×{decay:.2} | {resid:.1} |");
+    }
+}
+
+fn validate_water() {
+    println!("# Water-sim validation against literature benchmarks (PBF defaults)");
+    accel_check();
+    hydrostatic_test();
+    dam_break_test();
+    sloshing_test();
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--validate-water") {
+        validate_water();
+        return;
+    }
+    if std::env::args().any(|a| a == "--damp-sweep") {
+        damp_sweep();
+        return;
+    }
     if std::env::args().any(|a| a == "--settle-still") {
         settle_still(8);
         return;

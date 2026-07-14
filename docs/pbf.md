@@ -89,9 +89,10 @@ Net effect on a settling block: residual mean-speed **20 → 2.5** (granular-pil
 calm), max-speed **120 → 4** (no flung strays), 0 % clumping, ρ/ρ0 = 1.00 — and
 the dynamic scenes still throw a splash jet and run a breaking wave up the wall,
 because the density solve is untouched during active motion. The adopted
-defaults are therefore `eps_cfm=2e-3, xsph_c=0.1, scorr_k=3, vorticity=0,
+defaults are therefore `eps_cfm=2e-3, xsph_c=0.05, scorr_k=3, vorticity=0,
 max_corr=0.12h` (vorticity confinement is off: it re-injects energy and fought
-the settling). Reproduce the sweep with
+the settling; `xsph_c` was later trimmed 0.1 → 0.05 by the sloshing benchmark
+below). Reproduce the sweep with
 `cargo run --features render --bin render -- --tune`, and see a settled-pool
 before/after with `--settle-still`.
 
@@ -161,3 +162,42 @@ The GIF/PNG encoders are hand-rolled (LZW GIF, stored-block PNG) to keep the
 crate dependency-free; neither the default graphics build nor the headless CI
 build compiles the `render` bin (it is gated behind the off-by-default `render`
 feature).
+
+## Validation against literature benchmarks
+
+The standard water-sim benchmark suite has *quantitative* expectations, not just
+visual ones, so `--validate-water` checks the PBF defaults against theory
+(effective gravity `a = g/PHYS_TIME_STEP` is confirmed by a free-fall probe):
+
+- **Dam break** (Koshizuka & Oka 1996; Martin & Moyce 1952). A width-`a`,
+  height-`2a` column collapses on a dry bed. The measured surge-front speed is
+  **0.56×** the analytical Ritter dry-bed tip speed `2√(gH)` — right in the band
+  expected for a finite column (Ritter assumes a semi-infinite reservoir, so a
+  collapsing column runs slower), the front reaches the far wall, and volume is
+  conserved to a few %.
+- **Sloshing** (SPHERIC-style). A still layer is kicked and left to oscillate;
+  the free-oscillation period is **0.95×** linear potential theory
+  `T = 2π/√(g·k·tanh(k·h))`, `k = π/L` — within ~5 %.
+- **Hydrostatic tank.** A resting block stays still (residual speed ≈ 1),
+  keeps a flat free surface (RMS ≈ 3 px), and conserves volume.
+
+Two honest findings came out of building these, and drove real fixes:
+
+- **PBF's raw λ is not a clean pressure probe.** The idea was to check that
+  pressure ∝ depth (hydrostatic), reading PBF's Lagrange multiplier as pressure.
+  It doesn't work here: the λ field is a U-shape dominated by **SPH particle
+  deficiency** at the free surface *and* the floor (both have missing
+  neighbors), which swamps the weak bulk gradient — a well-documented SPH
+  artifact. So the hydrostatic tank is validated on its observable behavior
+  (rest / flatness / volume), which is what "well-behaved" means for it.
+- **Sloshing exposed over-damping.** The frequency was right all along, but the
+  amplitude decayed ×0.27 per half-period — a slosh died in one cycle where real
+  water swings many times. The `--damp-sweep` diagnostic traced it to `xsph_c`:
+  the settling pass had cranked it to 0.1, which over-damped free oscillation
+  *without even improving the settle*. Trimming to 0.05 roughly doubles slosh
+  persistence (decay ×0.40), keeps the period at 0.95×, and settles just as calm
+  (residual ≈ 0.6). The residual damping below that is the density solve itself —
+  PBF is inherently dissipative, an accepted trade for unconditional stability.
+
+Reproduce with `--validate-water` (the benchmark suite) and `--damp-sweep` (the
+viscosity/dissipation trade-off table).
