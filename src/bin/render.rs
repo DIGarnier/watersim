@@ -702,6 +702,72 @@ fn gif_selftest() {
     println!("wrote selftest/test.gif ({}x{}, 2 frames)", w, h);
 }
 
+/// Headless reproduction of the live app: drive each scenario under both models
+/// with the app's fixed-timestep loop and emit the same per-second diagnostic
+/// line `WATERSIM_DEBUG=1` prints, then a verdict. This is how we "run with
+/// debug" without a display — the numbers are what matter.
+fn debug_run() {
+    const SECONDS: usize = 6;
+    for scenario in scenarios() {
+        for strategy in [Strategy::Granular, Strategy::Pbf] {
+            let n = scenario.positions.len();
+            let (_tx, rx) = channel();
+            let mut physics =
+                Physics::new(scenario.positions.clone(), vec![Vec2::ZERO; n], rx, 2000.0);
+            physics.set_adaptive_dt(false); // fixed timestep, exactly like the app
+            physics.set_strategy(strategy);
+            let mut share = ShareData {
+                c_pos: scenario.positions.clone(),
+                c_color: vec![0.0; n],
+                ..Default::default()
+            };
+
+            let mut worst_speed = 0.0f32;
+            let mut worst_ratio = 0.0f32;
+            println!("\n=== {} / {strategy:?} ({n} particles) ===", scenario.name);
+            for sec in 0..SECONDS {
+                for sub in 0..480 {
+                    let frame = (sec * 480 + sub) / SUBSTEPS_PER_FRAME;
+                    physics.set_gravity((scenario.gravity)(frame));
+                    physics.step(PHYS_TIME_STEP, &mut share);
+                }
+                let ps = &share.perf_stats;
+                worst_speed = worst_speed.max(ps.max_speed);
+                worst_ratio = worst_ratio.max(ps.pbf_density_ratio);
+                let density = if strategy == Strategy::Pbf {
+                    format!(" rho/rho0={:.2}", ps.pbf_density_ratio)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  t={}s  mean_speed={:6.1}  max_speed={:7.1}{density}",
+                    sec + 1,
+                    ps.mean_speed,
+                    ps.max_speed,
+                );
+            }
+            let nan = share
+                .c_pos
+                .iter()
+                .filter(|p| !p.x.is_finite() || !p.y.is_finite())
+                .count();
+            let escaped = share
+                .c_pos
+                .iter()
+                .filter(|p| p.x < -1.0 || p.x > WIDTH + 1.0 || p.y < -1.0 || p.y > HEIGHT + 1.0)
+                .count();
+            let verdict = if nan == 0 && escaped == 0 {
+                "STABLE"
+            } else {
+                "UNSTABLE"
+            };
+            println!(
+                "  verdict: {verdict} (nan={nan}, escaped={escaped}, worst max_speed={worst_speed:.0}, worst rho/rho0={worst_ratio:.2})"
+            );
+        }
+    }
+}
+
 fn main() {
     if std::env::args().any(|a| a == "--gif-selftest") {
         gif_selftest();
@@ -709,6 +775,10 @@ fn main() {
     }
     if std::env::args().any(|a| a == "--stats") {
         stats_mode();
+        return;
+    }
+    if std::env::args().any(|a| a == "--debug-run") {
+        debug_run();
         return;
     }
     let pal = build_palette();
