@@ -60,33 +60,74 @@ fn main() -> GameResult {
             2000.0,
         );
         physics.set_strategy(strategy);
+        // Drive a FIXED internal timestep. The old loop fed the raw, variable
+        // wall-clock dt straight into the Størmer–Verlet / PBF integrators,
+        // which assume a constant dt: a changing dt reinterprets the encoded
+        // velocity and injects energy (the granular "breathing" wave), and the
+        // adaptive-dt controller made it worse by oscillating dt. A standard
+        // accumulator advances the sim in PHYS_TIME_STEP chunks to track real
+        // time, exactly like the headless render tool that stays stable.
+        physics.set_adaptive_dt(false);
+        let debug = std::env::var("WATERSIM_DEBUG").is_ok();
 
         let clock = std::time::Instant::now();
-        let mut phys_frame_start = clock.elapsed().as_secs_f32();
+        let mut last = clock.elapsed().as_secs_f32();
+        let mut accumulator = 0.0f32;
+        let mut step_count: u64 = 0;
         loop {
-            let dt = clock.elapsed().as_secs_f32() - phys_frame_start;
+            let now = clock.elapsed().as_secs_f32();
+            // Clamp the frame delta so a hitch (or a slow, particle-heavy step)
+            // can't build an unbounded backlog ("spiral of death").
+            accumulator += (now - last).min(0.05);
+            last = now;
 
-            if dt >= PHYS_TIME_STEP {
-                let Ok(mut share) = to_physics_thread.lock() else {
-                    continue;
-                };
+            if accumulator < PHYS_TIME_STEP {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+                continue;
+            }
 
-                physics.step(dt, &mut share);
+            let Ok(mut share) = to_physics_thread.lock() else {
+                continue;
+            };
 
-                if let Ok(event) = physics.rx.try_recv() {
-                    use EventToPthread::*;
-                    match event {
-                        Cannon((start, cannon)) => physics.do_cannon(dt, &mut share, start, cannon),
-                        Scale(scale) => {
-                            physics.scale += scale;
-                        }
-                        ToggleVerletLists => physics.toggle_verlet_lists(),
-                        ToggleAdaptiveDt => physics.toggle_adaptive_dt(),
+            let mut did = 0;
+            while accumulator >= PHYS_TIME_STEP && did < 48 {
+                physics.step(PHYS_TIME_STEP, &mut share);
+                accumulator -= PHYS_TIME_STEP;
+                did += 1;
+                step_count += 1;
+            }
+            // If we hit the substep cap the machine can't keep up; drop the
+            // backlog and run in slow motion rather than spiral.
+            accumulator = accumulator.min(PHYS_TIME_STEP);
+
+            while let Ok(event) = physics.rx.try_recv() {
+                use EventToPthread::*;
+                match event {
+                    Cannon((start, cannon)) => {
+                        physics.do_cannon(PHYS_TIME_STEP, &mut share, start, cannon)
                     }
+                    Scale(scale) => {
+                        physics.scale += scale;
+                    }
+                    ToggleVerletLists => physics.toggle_verlet_lists(),
+                    ToggleAdaptiveDt => physics.toggle_adaptive_dt(),
                 }
+            }
 
-                share.phys_time = dt;
-                phys_frame_start = clock.elapsed().as_secs_f32();
+            share.phys_time = PHYS_TIME_STEP;
+
+            if debug && step_count % 60 == 0 {
+                let ps = &share.perf_stats;
+                let density = if strategy == Strategy::Pbf {
+                    format!(" rho/rho0={:.2}", ps.pbf_density_ratio)
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "[{strategy:?}] n={} mean_speed={:.1} max_speed={:.1}{density} solve={}us",
+                    ps.total_particles, ps.mean_speed, ps.max_speed, ps.collision_time_us,
+                );
             }
         }
     });
@@ -276,6 +317,11 @@ impl event::EventHandler<ggez::GameError> for MainState {
             Collision: {}µs\n\
             Current dt: {:.6}s\n\
             \n\
+            Diagnostics:\n\
+            Mean speed: {:.1}\n\
+            Max speed: {:.1}\n\
+            {}\
+            \n\
             Controls:\n\
             [W/S] Adjust force scale\n\
             Mouse drag: Add particles",
@@ -292,6 +338,13 @@ impl event::EventHandler<ggez::GameError> for MainState {
             perf_stats.integration_time_us,
             perf_stats.collision_time_us,
             perf_stats.current_dt,
+            perf_stats.mean_speed,
+            perf_stats.max_speed,
+            if perf_stats.pbf_density_ratio > 0.0 {
+                format!("Density rho/rho0: {:.2}\n", perf_stats.pbf_density_ratio)
+            } else {
+                String::new()
+            },
         ));
 
         canvas.draw(

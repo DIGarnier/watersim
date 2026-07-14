@@ -65,6 +65,45 @@ the render tool (`src/bin/render.rs`):
 All PBF coefficients are runtime-tunable via `PbfParams` / `set_pbf_params` so
 the sweep can be repeated (`cargo run --features render --bin render -- --stats`).
 
+## Stability: drive a fixed timestep
+
+Both integrators (granular Størmer–Verlet and PBF's predict/velocity step)
+assume a **constant** dt. The headless render tool always steps at a fixed
+`dt = PHYS_TIME_STEP`, which is why it is rock-stable. The live app originally
+fed the raw, variable wall-clock dt straight in, with adaptive-dt on top — two
+distinct failures:
+
+- **Granular "breathing".** With Verlet, the velocity is encoded implicitly as
+  `x − x_prev`. Change dt between steps and that same displacement is
+  reinterpreted as a different velocity, injecting or removing energy. The
+  adaptive-dt controller then chased velocity by oscillating dt, producing the
+  visible limit cycle where particles float, then drop.
+- **PBF exploding when sparse.** A far-under-dense fluid (few particles,
+  C ≈ −0.8) drives `λ = −C/(Σ‖∇C‖²+ε)` huge because ε is tiny, and a large
+  variable dt turns that into a blow-up.
+
+The fix (`src/main.rs`): a standard fixed-timestep accumulator advances the sim
+in `PHYS_TIME_STEP` chunks to track real time, with adaptive-dt off
+(`set_adaptive_dt(false)`). The `--stats` sweep confirms that under a fixed dt
+even a 5×5 blob stays sane. Two cheap safety nets remain in the solver: `λ` is
+capped (`PbfParams::lambda_max`, default 30 — keeps ρ/ρ0 ≈ 0.99 while bounding
+the sparse pathology) and per-substep displacement is clamped to half a
+smoothing radius.
+
+## Debugging instability
+
+The engine now exposes coarse aggregate diagnostics in `PerformanceStats`
+(`mean_speed`, `max_speed`, and for PBF `pbf_density_ratio` = mean ρ/ρ0). The
+live HUD shows them, and setting `WATERSIM_DEBUG=1` logs them each second:
+
+```
+WATERSIM_DEBUG=1 cargo run --release -- --sim pbf
+# [Pbf] n=1240 mean_speed=3.1 max_speed=48.0 rho/rho0=0.99 solve=820us
+```
+
+A density ratio climbing well above 1, or a max_speed running away, is the
+signature of a blow-up — far easier to see than staring at particles.
+
 ## Seeing the difference
 
 `src/bin/render.rs` is a headless comparison renderer (the dev box has no

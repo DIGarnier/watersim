@@ -141,6 +141,14 @@ pub struct PerformanceStats {
     pub verlet_lists_enabled: bool,
     pub adaptive_dt_enabled: bool,
     pub current_dt: f32,
+    // Coarse diagnostics (aggregate "vector field" summaries) so instability
+    // is observable without a debugger. `*_speed` are the per-substep
+    // displacement metric |Δx|·20 (the same units the color hue uses);
+    // `pbf_density_ratio` is the mean ρ/ρ0 over a subsample (1.0 = perfectly
+    // incompressible, ≫1 = compressed/exploding, ≪1 = torn apart).
+    pub mean_speed: f32,
+    pub max_speed: f32,
+    pub pbf_density_ratio: f32,
 }
 
 /// Verlet neighbor lists in flat CSR layout: one contiguous `neighbors` array
@@ -671,6 +679,7 @@ impl Physics {
     fn integrate(&mut self, dt: f32, share: &mut ShareData) {
         let start = Instant::now();
         let mut max_velocity_sq: f32 = 0.0;
+        let mut speed_sum: f32 = 0.0;
 
         // Colors are only consumed by the 60 Hz renderer; recomputing them
         // (one sqrt + fmod per particle) on all 8 substeps per frame is waste.
@@ -691,6 +700,7 @@ impl Physics {
 
             // Track maximum velocity for adaptive time-stepping
             max_velocity_sq = max_velocity_sq.max(vel_sq);
+            speed_sum += vel_sq.sqrt();
 
             // Proper Størmer–Verlet: x' = 2x − x_prev + a·dt². The code
             // historically applied (G + F)·dt — an impulse, which made the
@@ -712,6 +722,10 @@ impl Physics {
         }
 
         self.last_max_velocity = max_velocity_sq.sqrt();
+        let n = share.c_pos.len().max(1) as f32;
+        share.perf_stats.max_speed = self.last_max_velocity;
+        share.perf_stats.mean_speed = speed_sum / n;
+        share.perf_stats.pbf_density_ratio = 0.0; // granular: n/a
         share.perf_stats.integration_time_us += start.elapsed().as_micros() as u64;
     }
 
@@ -1244,6 +1258,16 @@ impl Physics {
         );
     }
 
+    /// Explicitly enable/disable adaptive time-stepping. The live app disables
+    /// it and drives a fixed-timestep accumulator instead: the Størmer–Verlet
+    /// integrator assumes a constant dt, and changing dt each step reinterprets
+    /// the encoded velocity `(x − x_prev)`, injecting energy — which is what
+    /// made the granular sim "breathe" (float, then drop) under the adaptive
+    /// controller's limit cycle.
+    pub fn set_adaptive_dt(&mut self, on: bool) {
+        self.use_adaptive_dt = on;
+    }
+
     fn cannon(
         &mut self,
         shift: f32,
@@ -1323,6 +1347,13 @@ pub struct PbfParams {
     pub vorticity: f32,
     /// Per-iteration position-correction clamp, in pixels.
     pub max_corr: f32,
+    /// Upper bound on λ. λ < 0 resists compression (incompressibility); λ > 0
+    /// pulls under-dense regions together (surface tension). A sparse or
+    /// freshly-spawned fluid is far under rest density, where the tiny CFM ε
+    /// sends λ enormous and the solve explodes — so λ is capped here. The cap
+    /// is generous enough to keep normal cohesion (equilibrium λ is O(10s)) but
+    /// bounds the pathological blow-up with only a handful of particles.
+    pub lambda_max: f32,
 }
 
 impl Default for PbfParams {
@@ -1338,6 +1369,7 @@ impl Default for PbfParams {
             xsph_c: 0.08,
             vorticity: 0.0006,
             max_corr: 0.25 * PBF_H,
+            lambda_max: 30.0,
         }
     }
 }
@@ -1540,10 +1572,20 @@ impl Pbf {
             self.solve_iteration(x);
         }
 
-        // 4. Derive velocity from the total position change.
+        // 4. Derive velocity from the total position change, with a safety
+        // clamp: no particle may move more than half a smoothing radius per
+        // substep. This bounds a single bad step so a transient can't cascade
+        // into a full blow-up (belt-and-suspenders alongside the λ clamp).
         let inv_dt = 1.0 / dt;
+        let vmax = 0.5 * PBF_H * inv_dt;
+        let vmax2 = vmax * vmax;
         for i in 0..n {
-            self.vel[i] = (x[i] - self.prev[i]) * inv_dt;
+            let mut v = (x[i] - self.prev[i]) * inv_dt;
+            let s2 = v.length_squared();
+            if s2 > vmax2 {
+                v *= vmax / s2.sqrt();
+            }
+            self.vel[i] = v;
         }
 
         // 5. Velocity post-process: vorticity confinement then XSPH viscosity.
@@ -1554,15 +1596,37 @@ impl Pbf {
         // Verlet "previous position" convention (pos − v·dt) so the granular
         // color path and any external readers see a consistent velocity, and
         // c_color encodes speed as a hue like the granular integrator.
-        let update_colors = true;
+        let mut speed_sum = 0.0f32;
+        let mut max_speed = 0.0f32;
         for i in 0..n {
             c_opos[i] = x[i] - self.vel[i] * dt;
-            if update_colors {
-                // (c_pos − c_opos)*20 == vel*dt*20 is the granular speed metric.
-                let speed = (self.vel[i] * dt * 20.0).length();
-                share.c_color[i] = (speed + 198.0) % 360.0;
-            }
+            // (c_pos − c_opos)*20 == vel*dt*20 is the granular speed metric.
+            let speed = (self.vel[i] * dt * 20.0).length();
+            share.c_color[i] = (speed + 198.0) % 360.0;
+            speed_sum += speed;
+            max_speed = max_speed.max(speed);
         }
+
+        // Coarse diagnostics: mean ρ/ρ0 over a subsample. 1.0 = incompressible;
+        // a value climbing well above 1 is the visible signature of a blow-up.
+        let stride = (n / 256).max(1);
+        let mut dsum = 0.0f64;
+        let mut cnt = 0usize;
+        let mut i = 0;
+        while i < n {
+            let xi = x[i];
+            let mut rho = 0.0f32;
+            self.grid
+                .for_neighbors(xi, |j| rho += w_poly6((xi - x[j]).length_squared()));
+            dsum += (rho / self.rest_density) as f64;
+            cnt += 1;
+            i += stride;
+        }
+
+        let ps = &mut share.perf_stats;
+        ps.mean_speed = speed_sum / n as f32;
+        ps.max_speed = max_speed;
+        ps.pbf_density_ratio = (dsum / cnt.max(1) as f64) as f32;
     }
 
     /// One Jacobi iteration: density → λ (parallel gather), then Δx from the
@@ -1574,6 +1638,7 @@ impl Pbf {
         let eps_cfm = self.params.eps_cfm;
         let scorr_k = self.params.scorr_k;
         let max_corr = self.params.max_corr;
+        let lambda_max = self.params.lambda_max;
 
         // Pass A: density and λ. ∇_i C_i = (1/ρ0) Σ_j ∇W_ij; the constraint
         // gradient sum is |Σ_j ∇W|² (the k=i term) plus Σ_j|∇W|² (k=j terms),
@@ -1597,7 +1662,11 @@ impl Pbf {
                 });
                 let c = rho * inv_rho0 - 1.0;
                 let sum_grad_c2 = (grad_i.length_squared() + sum_grad2) * (inv_rho0 * inv_rho0);
-                *lam = -c / (sum_grad_c2 + eps_cfm);
+                // Cap λ (see PbfParams::lambda_max): keeps incompressibility
+                // and normal cohesion but bounds the huge positive λ a sparse,
+                // far-under-dense fluid would otherwise produce, which is what
+                // made a handful of particles explode in the live app.
+                *lam = (-c / (sum_grad_c2 + eps_cfm)).min(lambda_max);
             });
         }
 

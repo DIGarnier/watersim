@@ -565,36 +565,29 @@ impl BitWriter {
 // ---------------------------------------------------------------------------
 
 /// Diagnostic: settle a PBF block and report how well it holds the rest
-/// spacing. `mean nn` should sit near the rest spacing (6 px); a small value or
-/// many "clumped" pairs (nn < 3 px) means the anti-clumping term is too weak.
+/// spacing and whether it stays finite. Sweeps the λ cap on both a dense block
+/// (should stay incompressible, ρ/ρ0 ≈ 1) and a tiny blob (the sparse case that
+/// exploded in the live app — must stay sane). `mean nn` should sit near the
+/// rest spacing (6 px).
 fn stats_mode() {
-    // Report the adopted defaults, plus a couple of neighbors so the stability
-    // window around the chosen s_corr strength stays visible.
-    let sweep = [
-        PbfParams::default(),
-        PbfParams {
-            scorr_k: 3.0,
+    for &lambda_max in &[f32::INFINITY, 100.0, 30.0, 10.0] {
+        println!("=== lambda_max = {lambda_max} ===");
+        let params = PbfParams {
+            lambda_max,
             ..PbfParams::default()
-        },
-        PbfParams {
-            scorr_k: 10.0,
-            ..PbfParams::default()
-        },
-    ];
-    for params in sweep {
-        println!(
-            "--- scorr_k={} eps={} iters={} xsph={} vort={} ---",
-            params.scorr_k, params.eps_cfm, params.iters, params.xsph_c, params.vorticity
-        );
-        settle_and_report(params);
+        };
+        print!("  dense(40x40): ");
+        settle_and_report(params, 40);
+        print!("  tiny (5x5):   ");
+        settle_and_report(params, 5);
     }
 }
 
-fn settle_and_report(params: PbfParams) {
+fn settle_and_report(params: PbfParams, dim: usize) {
     let s = 2.0 * BALL_SIZE;
     let mut positions = Vec::new();
-    for gy in 0..40 {
-        for gx in 0..40 {
+    for gy in 0..dim {
+        for gx in 0..dim {
             positions.push(Vec2::new(400.0 + gx as f32 * s, 300.0 + gy as f32 * s));
         }
     }
@@ -664,17 +657,24 @@ fn settle_and_report(params: PbfParams) {
         dens_sum += rho as f64;
     }
     let mean_rho = dens_sum / sample as f64;
+    let nan = p
+        .iter()
+        .filter(|q| !q.x.is_finite() || !q.y.is_finite())
+        .count();
+    let escaped = p
+        .iter()
+        .filter(|q| q.x < -1.0 || q.x > WIDTH + 1.0 || q.y < -1.0 || q.y > HEIGHT + 1.0)
+        .count();
+    let sane = if nan == 0 && escaped == 0 {
+        "ok".to_string()
+    } else {
+        format!("{nan} NaN, {escaped} escaped")
+    };
     println!(
-        "PBF settle: n={n}  mean nn={:.2}px (rest {s:.1})  clumped(<{:.1})={clumped}  height={:.0}",
+        "n={n:<4} mean_nn={:.2} clumped={clumped:<4} height={:.0} ratio={:.2} sane={sane}",
         nn_sum / n as f64,
-        0.5 * s,
-        ymax - ymin
-    );
-    println!(
-        "  rho0(lattice)={:.5}  mean rho(achieved)={:.5}  ratio={:.2}",
-        rho0,
-        mean_rho,
-        mean_rho / rho0 as f64
+        ymax - ymin,
+        mean_rho / rho0 as f64,
     );
 }
 
