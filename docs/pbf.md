@@ -59,11 +59,45 @@ the render tool (`src/bin/render.rs`):
   ρ/ρ0 was 0.99 (incompressible!) while particles still paired up at ~2 px,
   because poly6 density is a smooth large-radius sum that many uneven layouts
   satisfy. Breaking that degeneracy is precisely the job of `s_corr`, and in
-  this unit system it needs `k ≈ 6` (not 0.1) to hold the rest spacing. Above
-  `k ≈ 8` the solve overshoots and destabilizes — a sharp cliff.
+  this unit system it needs `k` of order a few (not 0.1) to hold the rest
+  spacing — `k ≈ 6` at this stage, later lowered to 3 once the settling pass
+  below reduced the clumping by other means. Above `k ≈ 8` the solve overshoots
+  and destabilizes — a sharp cliff.
 
 All PBF coefficients are runtime-tunable via `PbfParams` / `set_pbf_params` so
 the sweep can be repeated (`cargo run --features render --bin render -- --stats`).
+
+## Making it settle like real water
+
+Once the model was stable it still didn't *look* right: a settled pool kept
+churning (mean particle speed ≈ 470 px/s that never decayed) with a few
+particles flung out of it. Real water settles to still, so this was excess
+energy the model wasn't dissipating. The `--tune` diagnostic (drop a block,
+measure residual mean/max speed after it settles) drove two fixes:
+
+- **XSPH viscosity was missing its `1/ρ0` volume weight.** The smoothing sum
+  `Σ (vⱼ−vᵢ) W` is scaled by the raw kernel value (≈ρ0 ≈ 0.028 here), so
+  without dividing by ρ0 the viscosity was ~35× too weak — raising `c` from
+  0.08 to 0.4 barely changed anything. With the weight, `c` is a real dial and
+  a full neighborhood of coherent motion actually damps.
+- **ε=1e-4 was too *stiff*.** A near-zero CFM makes the density projection so
+  hard it overshoots each substep and *rings* — the churn that no amount of
+  viscosity removed. Softening ε to 2e-3 (still ≪ the ~7e-3 gradient sum, so
+  ρ/ρ0 stays ≈ 1) let the solve come to rest.
+
+Net effect on a settling block: residual mean-speed **20 → 2.5** (granular-pile
+calm), max-speed **120 → 4** (no flung strays), 0 % clumping, ρ/ρ0 = 1.00 — and
+the dynamic scenes still throw a splash jet and run a breaking wave up the wall,
+because the density solve is untouched during active motion. The adopted
+defaults are therefore `eps_cfm=2e-3, xsph_c=0.1, scorr_k=3, vorticity=0,
+max_corr=0.12h` (vorticity confinement is off: it re-injects energy and fought
+the settling). Reproduce the sweep with
+`cargo run --features render --bin render -- --tune`, and see a settled-pool
+before/after with `--settle-still`.
+
+The earlier `k ≈ 6` / `ε = 1e-4` values (before this pass) held the rest density
+but produced the churn; they survive only in `--settle-still`'s left panel for
+comparison.
 
 ## Stability: drive a fixed timestep
 

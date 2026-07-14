@@ -1358,17 +1358,21 @@ pub struct PbfParams {
 
 impl Default for PbfParams {
     fn default() -> Self {
-        // Swept with the render tool's `--stats` diagnostic: this combination
-        // holds the rest density (ρ/ρ0 ≈ 0.99) with the least local clumping
-        // while staying comfortably below the stability cliff near k ≈ 8.
+        // Swept with the render tool's `--tune` diagnostic to settle like real
+        // water: residual mean-speed ≈ granular's, no flung strays, ρ/ρ0 ≈ 1,
+        // no clumping. Two findings drove the values: XSPH needed its missing
+        // 1/ρ0 volume weight to actually damp, and ε=1e-4 was too *stiff* — the
+        // density solve rang and never came to rest — so ε=2e-3 softens it.
+        // Vorticity confinement is off (it re-injects energy and fought the
+        // settling); s_corr is modest and the per-iteration clamp tight.
         Self {
             iters: 6,
-            eps_cfm: 1.0e-4,
-            scorr_k: 6.0,
+            eps_cfm: 2.0e-3,
+            scorr_k: 3.0,
             scorr_dq: 0.2 * PBF_H,
-            xsph_c: 0.08,
-            vorticity: 0.0006,
-            max_corr: 0.25 * PBF_H,
+            xsph_c: 0.1,
+            vorticity: 0.0,
+            max_corr: 0.12 * PBF_H,
             lambda_max: 30.0,
         }
     }
@@ -1704,12 +1708,20 @@ impl Pbf {
         }
     }
 
-    /// XSPH viscosity (paper eq. 17): v_i ← v_i + c Σ_j (v_j − v_i) W_ij.
+    /// XSPH viscosity (paper eq. 17): v_i ← v_i + c Σ_j (v_j − v_i) W_ij / ρ0.
     /// Double-buffered so every particle reads the pre-update velocities.
+    ///
+    /// The `1/ρ0` is the SPH volume weight (mⱼ/ρⱼ) and is essential: without it
+    /// the sum is scaled by the raw kernel value (≈ρ0 ≈ 0.028 in this unit
+    /// system), making the smoothing ~1/ρ0 ≈ 35× too weak — which is why a
+    /// full neighborhood of coherent motion (the churn a settling pool should
+    /// dissipate) barely damped at any `c`. With the weight, c ∈ [0,1] behaves
+    /// like a real viscosity dial.
     fn apply_xsph(&mut self, x: &[Vec2]) {
         let grid = &self.grid;
         let vel = &self.vel;
         let xsph_c = self.params.xsph_c;
+        let inv_rho0 = 1.0 / self.rest_density;
         let out = &mut self.vscratch;
         out.par_iter_mut().enumerate().for_each(|(i, o)| {
             let xi = x[i];
@@ -1722,7 +1734,7 @@ impl Pbf {
                 let w = w_poly6((xi - x[j]).length_squared());
                 acc += (vel[j] - vi) * w;
             });
-            *o = vi + acc * xsph_c;
+            *o = vi + acc * (xsph_c * inv_rho0);
         });
         std::mem::swap(&mut self.vel, &mut self.vscratch);
     }
