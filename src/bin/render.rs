@@ -1561,7 +1561,130 @@ fn validate_water() {
     two_column_test();
 }
 
+// ---------------------------------------------------------------------------
+// Performance comparison (sequential; one solver at a time so the numbers are
+// clean). Times each strategy on each scenario's initial state and reports the
+// wall-clock cost per 480 Hz substep.
+// ---------------------------------------------------------------------------
+
+fn perf_mode() {
+    const WARMUP: usize = 30;
+    const MEASURE: usize = 250;
+    println!("# Solver performance (sequential, release)");
+    println!("warmup {WARMUP} substeps, measured over {MEASURE} substeps each\n");
+    println!("| scenario | particles | solver | ms/substep | substeps/s | vs granular |");
+    println!("|---|---|---|---|---|---|");
+    for scenario in scenarios() {
+        let n = scenario.positions.len();
+        let mut granular_ms = 0.0f64;
+        for &strat in Strategy::all() {
+            let (_tx, rx) = channel();
+            let mut physics =
+                Physics::new(scenario.positions.clone(), vec![Vec2::ZERO; n], rx, 2000.0);
+            physics.set_adaptive_dt(false);
+            physics.set_strategy(strat);
+            physics.set_gravity((scenario.gravity)(0));
+            let mut share = ShareData {
+                c_pos: scenario.positions.clone(),
+                c_color: vec![0.0; n],
+                ..Default::default()
+            };
+            for _ in 0..WARMUP {
+                physics.step(PHYS_TIME_STEP, &mut share);
+            }
+            let t = std::time::Instant::now();
+            for _ in 0..MEASURE {
+                physics.step(PHYS_TIME_STEP, &mut share);
+            }
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / MEASURE as f64;
+            if strat == Strategy::Granular {
+                granular_ms = ms;
+            }
+            let rel = if granular_ms > 0.0 {
+                format!("{:.2}×", ms / granular_ms)
+            } else {
+                "—".to_string()
+            };
+            println!(
+                "| {} | {n} | {} | {:.3} | {:.0} | {rel} |",
+                scenario.name,
+                strat.token(),
+                ms,
+                1000.0 / ms,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Animated-WebP clip generator (feature = "media"): one clip per solver per
+// scenario, for the comparison artifact. Uses libwebp via the `webp` crate.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "media")]
+fn idx_to_rgba(idx: &[u8], pal: &[[u8; 3]; 256]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(idx.len() * 4);
+    for &i in idx {
+        let c = pal[i as usize];
+        out.extend_from_slice(&[c[0], c[1], c[2], 255]);
+    }
+    out
+}
+
+#[cfg(feature = "media")]
+fn webp_write(path: &str, w: usize, h: usize, frames: &[Vec<u8>], pal: &[[u8; 3]; 256], fps: u32) {
+    use webp::{AnimEncoder, AnimFrame, WebPConfig};
+    let rgba: Vec<Vec<u8>> = frames.iter().map(|f| idx_to_rgba(f, pal)).collect();
+    let mut config = WebPConfig::new().expect("webp config");
+    config.lossless = 0;
+    config.quality = 70.0;
+    config.method = 4;
+    let mut enc = AnimEncoder::new(w as u32, h as u32, &config);
+    enc.set_loop_count(0);
+    let dt = (1000 / fps) as i32;
+    for (i, r) in rgba.iter().enumerate() {
+        enc.add_frame(AnimFrame::from_rgba(r, w as u32, h as u32, i as i32 * dt));
+    }
+    let mem = enc.encode();
+    std::fs::write(path, &*mem).unwrap();
+}
+
+#[cfg(feature = "media")]
+fn webp_mode() {
+    let pal = build_palette();
+    let out_dir = "renders";
+    std::fs::create_dir_all(out_dir).unwrap();
+    println!("panels {PANEL_W}x{PANEL_H}, {FRAMES} frames @ {FPS} fps");
+    for scenario in scenarios() {
+        for &strat in Strategy::all() {
+            let t = std::time::Instant::now();
+            let frames = simulate(&scenario, strat);
+            let path = format!("{out_dir}/{}_{}.webp", scenario.name, strat.token());
+            webp_write(&path, PANEL_W, PANEL_H, &frames, &pal, FPS);
+            let kb = std::fs::metadata(&path).unwrap().len() / 1024;
+            println!(
+                "  wrote {path} ({kb} KB) in {:.1}s",
+                t.elapsed().as_secs_f32()
+            );
+        }
+    }
+}
+
 fn main() {
+    if std::env::args().any(|a| a == "--perf") {
+        perf_mode();
+        return;
+    }
+    #[cfg(feature = "media")]
+    if std::env::args().any(|a| a == "--webp") {
+        webp_mode();
+        return;
+    }
+    #[cfg(not(feature = "media"))]
+    if std::env::args().any(|a| a == "--webp") {
+        eprintln!("--webp requires: cargo run --features media --bin render -- --webp");
+        return;
+    }
     if std::env::args().any(|a| a == "--validate-water") {
         validate_water();
         return;

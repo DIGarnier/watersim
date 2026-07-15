@@ -25,11 +25,16 @@ required-features = ["render"]
 default = ["graphics"]
 graphics = ["dep:ggez"]
 render = []
+# Adds animated-WebP output to the render tool (pulls libwebp via the `webp`
+# crate). Off by default so neither CI build compiles it; enable with
+# `--features media` for the `--webp` clip generator.
+media = ["render", "dep:webp"]
 
 [dependencies]
 glam = "0.24.1"
 rayon = "1.10"
 ggez = { version = "0.9.0", optional = true }
+webp = { version = "0.3", optional = true }
 
 [[bench]]
 name = "nbody"
