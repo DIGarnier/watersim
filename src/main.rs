@@ -108,7 +108,7 @@ fn main() -> GameResult {
                         physics.do_cannon(PHYS_TIME_STEP, &mut share, start, cannon)
                     }
                     Scale(scale) => {
-                        physics.scale += scale;
+                        physics.add_scale(scale);
                     }
                     ToggleVerletLists => physics.toggle_verlet_lists(),
                     ToggleAdaptiveDt => physics.toggle_adaptive_dt(),
