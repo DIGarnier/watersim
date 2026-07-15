@@ -5,19 +5,30 @@ simulation literature, with every optimization measured before adoption.
 
 ## The model(s)
 
-Two selectable particle-fluid models (`--sim granular|pbf`, default granular):
+Four selectable particle-fluid models (`--sim granular|pbf|dfsph|mlsmpm`,
+default granular), each a self-contained *strategy* chosen once at startup.
+They span three method families; see [docs/solvers.md](docs/solvers.md) for the
+architecture and the evaluation behind the choice.
 
-- **Granular** — local pressure-like repulsion with compact support (cutoff =
-  2.5 particle radii, smoothly tapered to zero), position-based contact
-  projection, and Størmer–Verlet integration at 480 Hz substeps. It stacks and
-  slumps like a pile of balls. O(n) per step via a counting-sort CSR grid whose
-  cell size equals the interaction cutoff, making the one-cell stencil provably
-  exact (`--validate` checks it against the O(n²) sum).
-- **PBF** — Position Based Fluids (Macklin & Müller, SIGGRAPH 2013): the same
-  position-projection solver enforces a *density* constraint instead of
-  non-penetration, so the particles pour, splash, and slosh as an
-  incompressible liquid. See [docs/pbf.md](docs/pbf.md) for the algorithm, the
-  side-by-side comparison renders, and the tuning notes.
+- **Granular** (PBD) — local pressure-like repulsion with compact support
+  (cutoff = 2.5 particle radii, smoothly tapered to zero), position-based
+  contact projection, and Størmer–Verlet integration at 480 Hz substeps. It
+  stacks and slumps like a pile of balls. O(n) per step via a counting-sort CSR
+  grid whose cell size equals the interaction cutoff, making the one-cell
+  stencil provably exact (`--validate` checks it against the O(n²) sum).
+- **PBF** (PBD) — Position Based Fluids (Macklin & Müller, SIGGRAPH 2013): the
+  same position-projection solver enforces a *density* constraint instead of
+  non-penetration, so the particles pour, splash, and slosh as an incompressible
+  liquid. Stable but inherently dissipative. See [docs/pbf.md](docs/pbf.md).
+- **DFSPH** (pressure-SPH) — Divergence-Free SPH (Bender & Koschier 2015/17):
+  incompressibility from a *pressure force* (a constant-density and a
+  divergence-free velocity solve) rather than geometric projection, so it's
+  crisp and low-dissipation — sharper splashes and livelier sloshing than PBF.
+- **MLS-MPM** (hybrid grid+particle) — Moving-Least-Squares Material Point
+  Method (Hu et al. 2018): particles carry state, a background grid does the
+  momentum solve (APIC transfers). A weakly-compressible **liquid** by default;
+  swap the constitutive model for an elastic **jelly** — the one model here that
+  does elastic solids, not just fluids.
 
 ## Optimization techniques (all measured; see docs/benchmarks)
 
@@ -36,7 +47,8 @@ Two selectable particle-fluid models (`--sim granular|pbf`, default granular):
 - **V**: Toggle Verlet neighbor lists
 - **A**: Toggle adaptive time-stepping
 
-Launch flag: `--sim granular` (default) or `--sim pbf` selects the fluid model.
+Launch flag: `--sim granular|pbf|dfsph|mlsmpm` selects the fluid model
+(default granular).
 
 ## Performance
 
@@ -78,9 +90,12 @@ cargo bench --no-default-features --bench nbody -- --quick
 
 Based on research from:
 - Müller et al. (2003) / Macklin & Müller (2013) / Clavet et al. (2005): local particle water models
+- Bender & Koschier (2015, 2017): Divergence-Free SPH (DFSPH)
+- Hu et al. (2018) / Jiang et al. (2015): MLS-MPM and the APIC transfer
 - Verlet (1967): neighbor lists for molecular dynamics
 - Green (2010) / Hoetzlein (2014): counting-sort uniform grids (CSR layout)
 - Tuckerman, Berne & Martyna (1992): r-RESPA multiple time stepping
 - Macklin et al. (2014, 2019): constraint relaxation; "Small Steps in Physics Simulation"
 
-Full annotated bibliography with links: [docs/literature.md](docs/literature.md).
+Full annotated bibliography with links: [docs/literature.md](docs/literature.md);
+the solver survey and design notes: [docs/solvers.md](docs/solvers.md).

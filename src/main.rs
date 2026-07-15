@@ -39,7 +39,12 @@ fn parse_strategy() -> Strategy {
 
 fn main() -> GameResult {
     let strategy = parse_strategy();
-    println!("fluid model: {strategy:?}  (switch with --sim granular|pbf)");
+    let choices = Strategy::all()
+        .iter()
+        .map(|s| s.token())
+        .collect::<Vec<_>>()
+        .join("|");
+    println!("fluid model: {strategy:?}  (switch with --sim {choices})");
     let (mut ctx, events_loop) = ContextBuilder::new("ballz", "ggez")
         .window_setup(WindowSetup::default().vsync(false))
         .window_mode(WindowMode::default().dimensions(WIDTH, HEIGHT))

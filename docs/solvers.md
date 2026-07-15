@@ -85,22 +85,44 @@ acronym.
 | VSLSPH | — | — | Not a standard, citable method; skipped pending a concrete reference. |
 | Cumulant LBM | Lattice Boltzmann (Eulerian) | State-of-the-art collision operator | **Poor fit** — a field on a fixed lattice, no Lagrangian particles. Rendering it as moving circles needs free-surface VOF + tracers bolted on: a separate visualization, not a drop-in strategy. Deferred. |
 
-### Decision
+### Decision — implemented
 
-Add two methods that each open a *new* corner of the design space:
+Two methods were added, each opening a *new* corner of the design space:
 
-1. **DFSPH** (Bender & Koschier 2015/17) — the pressure-SPH answer to "PBF but
-   crisp." Two solves per step (constant-density **and** divergence-free) give
-   true incompressibility with low numerical dissipation, so it stays lively:
-   sharp splashes, persistent sloshing. The direct contrast to PBF's mushiness.
-2. **MLS-MPM** (Hu et al. 2018) — a hybrid Eulerian–Lagrangian method. Particles
-   carry mass, velocity (APIC affine state), and a deformation gradient; a
-   background grid does the momentum solve. Swapping the constitutive model
-   turns the *same* solver from fluid to elastic jelly to granular sand. Nothing
-   else here can do elastoplastic solids.
+1. **DFSPH** (`dfsph.rs`, Bender & Koschier 2015/17) — the pressure-SPH answer
+   to "PBF but crisp." Two solves per step (constant-density **and**
+   divergence-free) give true incompressibility with low numerical dissipation,
+   so it stays lively: sharp splashes, persistent sloshing. On the same
+   drop-and-settle blob it settles to a residual speed ~1.5× PBF's (livelier by
+   design) while keeping the interior incompressible.
+2. **MLS-MPM** (`mlsmpm.rs`, Hu et al. 2018) — a hybrid Eulerian–Lagrangian
+   method. Particles carry mass, velocity (APIC affine state), and a deformation
+   gradient; a background grid does the momentum solve. Swapping the
+   constitutive model (`MpmMaterial`) turns the *same* solver from a
+   weakly-compressible **liquid** into an elastic **jelly**. Nothing else here
+   does elastic solids.
 
-Coverage after these land: PBD (Granular, PBF), pressure-SPH (DFSPH), and hybrid
-MPM (MLS-MPM) — four methods spanning three distinct families.
+Coverage now: PBD (Granular, PBF), pressure-SPH (DFSPH), and hybrid MPM
+(MLS-MPM) — four methods spanning three distinct families, all behind the one
+`FluidSolver` trait.
+
+### Implementation notes (things that bit us, so they don't again)
+
+- **DFSPH factor.** The stiffness α_i (Bender & Koschier eq. 8) carries ρ_i in
+  its numerator, so `k_i/ρ_i` cancels the density. Dividing by density *again*
+  in the velocity update inflates every correction by 1/ρ0 (≈35× in this unit
+  system) and boils the fluid — `apply_pressure_velocity` sums the k/ρ ratio
+  directly.
+- **DFSPH ordering.** The divergence-free solve must run at the *end* of the
+  step, on the freshly-advected positions (paper Algorithm 1). Running it up
+  front left compression waves in the velocity field and the fluid jittered
+  (residual speed ~3× higher). This is the single biggest calm-vs-jitter knob.
+- **MPM liquid volume.** Accumulating J = det(F) multiplicatively lets a violent
+  compression (the floor impact) drive J→0, where the J·(J−1) equation of state
+  has ~0 restoring force and J can never recover — the fluid goes permanently
+  "pressureless" and clumps. Clamping J to [0.6, 1.4] keeps the pressure strong
+  at the extremes so it self-corrects back to J≈1. Stiffness must also be scaled
+  to this codebase's large effective gravity (accel ≈ 4700): bulk ≈ 2e5.
 
 ## References
 

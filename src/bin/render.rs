@@ -709,7 +709,7 @@ fn gif_selftest() {
 fn debug_run() {
     const SECONDS: usize = 6;
     for scenario in scenarios() {
-        for strategy in [Strategy::Granular, Strategy::Pbf] {
+        for &strategy in Strategy::all() {
             let n = scenario.positions.len();
             let (_tx, rx) = channel();
             let mut physics =
@@ -734,10 +734,11 @@ fn debug_run() {
                 let ps = &share.perf_stats;
                 worst_speed = worst_speed.max(ps.max_speed);
                 worst_ratio = worst_ratio.max(ps.pbf_density_ratio);
-                let density = if strategy == Strategy::Pbf {
-                    format!(" rho/rho0={:.2}", ps.pbf_density_ratio)
-                } else {
+                // The SPH-family models (PBF, DFSPH) report a density ratio.
+                let density = if strategy == Strategy::Granular {
                     String::new()
+                } else {
+                    format!(" rho/rho0={:.2}", ps.pbf_density_ratio)
                 };
                 println!(
                     "  t={}s  mean_speed={:6.1}  max_speed={:7.1}{density}",

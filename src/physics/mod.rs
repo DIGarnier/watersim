@@ -20,15 +20,20 @@
 //!
 //! See `docs/solvers.md` for the survey of these and the methods being added.
 
+mod dfsph;
 mod granular;
+mod mlsmpm;
 mod pbf;
+mod sph;
 
 use glam::Vec2;
 use std::sync::mpsc::Receiver;
 
 use crate::constants::{BALL_SIZE, HEIGHT, INITIAL_BALL_SPEED_MODIFIER, WIDTH};
 
+pub use dfsph::{Dfsph, DfsphParams};
 pub use granular::GranularSolver;
+pub use mlsmpm::{Mlsmpm, MpmMaterial, MpmParams};
 pub use pbf::{Pbf, PbfParams};
 
 const GRAVITY: Vec2 = Vec2::new(0.0, 9.8);
@@ -58,6 +63,12 @@ pub enum Strategy {
     #[default]
     Granular,
     Pbf,
+    /// Divergence-Free SPH (Bender & Koschier): crisp, low-dissipation
+    /// incompressible water. See [`dfsph`].
+    Dfsph,
+    /// MLS-MPM (Hu et al.): hybrid grid+particle method; fluid by default,
+    /// elastic jelly with a swapped constitutive model. See [`mlsmpm`].
+    Mlsmpm,
 }
 
 impl Strategy {
@@ -65,13 +76,20 @@ impl Strategy {
         match s.to_ascii_lowercase().as_str() {
             "granular" | "balls" | "repulsion" => Some(Strategy::Granular),
             "pbf" | "fluid" | "water" => Some(Strategy::Pbf),
+            "dfsph" | "divergence-free" => Some(Strategy::Dfsph),
+            "mlsmpm" | "mpm" | "jelly" => Some(Strategy::Mlsmpm),
             _ => None,
         }
     }
 
     /// Every selectable strategy, for `--list-sims` / help text.
     pub fn all() -> &'static [Strategy] {
-        &[Strategy::Granular, Strategy::Pbf]
+        &[
+            Strategy::Granular,
+            Strategy::Pbf,
+            Strategy::Dfsph,
+            Strategy::Mlsmpm,
+        ]
     }
 
     /// The canonical `--sim` token for this strategy.
@@ -79,6 +97,8 @@ impl Strategy {
         match self {
             Strategy::Granular => "granular",
             Strategy::Pbf => "pbf",
+            Strategy::Dfsph => "dfsph",
+            Strategy::Mlsmpm => "mlsmpm",
         }
     }
 
@@ -86,6 +106,8 @@ impl Strategy {
         match self {
             Strategy::Granular => Box::new(GranularSolver::new(scale, Vec::new())),
             Strategy::Pbf => Box::new(Pbf::new()),
+            Strategy::Dfsph => Box::new(Dfsph::new()),
+            Strategy::Mlsmpm => Box::new(Mlsmpm::new()),
         }
     }
 }
@@ -163,6 +185,8 @@ pub trait FluidSolver: Send {
     fn toggle_verlet_lists(&mut self) {}
     /// Override the density-solver coefficients (PBF only).
     fn set_pbf_params(&mut self, _params: PbfParams) {}
+    /// Override the MLS-MPM coefficients / material (MPM only).
+    fn set_mpm_params(&mut self, _params: MpmParams) {}
 
     /// Bench/test hook: forces via the grid stencil (granular only; empty
     /// otherwise). See [`GranularSolver`].
@@ -248,6 +272,11 @@ impl Physics {
     /// Override the PBF coefficients (used by the render tool to sweep them).
     pub fn set_pbf_params(&mut self, params: PbfParams) {
         self.solver.set_pbf_params(params);
+    }
+
+    /// Override the MLS-MPM coefficients / material.
+    pub fn set_mpm_params(&mut self, params: MpmParams) {
+        self.solver.set_mpm_params(params);
     }
 
     /// Far-field force refresh interval in substeps (1 = every substep).
