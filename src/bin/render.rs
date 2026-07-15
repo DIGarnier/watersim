@@ -22,7 +22,7 @@ use lolballs::physics::{PbfParams, Physics, ShareData, Strategy, PHYS_TIME_STEP}
 // Render configuration
 // ---------------------------------------------------------------------------
 
-const PANEL_W: usize = 460; // panel width in pixels
+const PANEL_W: usize = 320; // panel width in pixels
 const PANEL_H: usize = (PANEL_W as f32 * HEIGHT / WIDTH) as usize; // keep aspect
 const MARGIN: usize = 12;
 const GAP: usize = 12; // gap between the two panels
@@ -1637,8 +1637,8 @@ fn webp_write(path: &str, w: usize, h: usize, frames: &[Vec<u8>], pal: &[[u8; 3]
     let rgba: Vec<Vec<u8>> = frames.iter().map(|f| idx_to_rgba(f, pal)).collect();
     let mut config = WebPConfig::new().expect("webp config");
     config.lossless = 0;
-    config.quality = 70.0;
-    config.method = 4;
+    config.quality = 46.0;
+    config.method = 5;
     let mut enc = AnimEncoder::new(w as u32, h as u32, &config);
     enc.set_loop_count(0);
     let dt = (1000 / fps) as i32;
