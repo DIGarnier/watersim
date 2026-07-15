@@ -117,12 +117,18 @@ Coverage now: PBD (Granular, PBF), pressure-SPH (DFSPH), and hybrid MPM
   step, on the freshly-advected positions (paper Algorithm 1). Running it up
   front left compression waves in the velocity field and the fluid jittered
   (residual speed ~3× higher). This is the single biggest calm-vs-jitter knob.
-- **MPM liquid volume.** Accumulating J = det(F) multiplicatively lets a violent
-  compression (the floor impact) drive J→0, where the J·(J−1) equation of state
-  has ~0 restoring force and J can never recover — the fluid goes permanently
-  "pressureless" and clumps. Clamping J to [0.6, 1.4] keeps the pressure strong
-  at the extremes so it self-corrects back to J≈1. Stiffness must also be scaled
-  to this codebase's large effective gravity (accel ≈ 4700): bulk ≈ 2e5.
+- **MPM liquid EOS.** A `λ·J·(J−1)` equation of state *vanishes* as J→0 (both
+  factors go to zero), so a hard floor impact drives the volume ratio to zero,
+  the pressure dies, and the fluid flattens onto one grid row and spreads as a
+  pressureless sheet — a visible "pancake". Clamping J only freezes that
+  degenerate state; the real fix is the linear mpm88 EOS `E·(J−1)`, which keeps
+  a finite restoring force at every J so the volume can't collapse (J is then
+  tracked from the velocity divergence, `J ← J·(1 + Δt·tr C)`, with no physics
+  clamp). The stiffness must also resist an impact's *dynamic* pressure (½ρv² ≈
+  3e6) under this engine's large effective gravity (accel ≈ 4700): E ≈ 1e7,
+  which holds impacts to ~15–25% compression and still clears the CFL ceiling
+  (√E·Δt/Δx ≈ 0.55). Jelly's Lamé λ is tied to its shear μ (λ ≈ 5μ), not the
+  liquid's E — a λ ≫ μ would swamp the shear and the jelly would flow.
 
 ## References
 
