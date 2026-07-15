@@ -1562,6 +1562,83 @@ fn validate_water() {
 }
 
 // ---------------------------------------------------------------------------
+// MLS-MPM diagnostic: drop a blob in an empty box and drive it under MPM and a
+// reference method (DFSPH), printing time-series metrics and dumping PNG frames
+// so the behavioral difference is measurable and visible.
+// ---------------------------------------------------------------------------
+
+fn mpm_diag() {
+    let pal = build_palette();
+    std::fs::create_dir_all("renders").unwrap();
+
+    // A compact square blob, dropped from up high into an empty box.
+    let s = 2.0 * BALL_SIZE;
+    let mut blob = Vec::new();
+    let (x0, y0) = (0.42 * WIDTH, 0.10 * HEIGHT);
+    for gy in 0..40 {
+        for gx in 0..40 {
+            blob.push(Vec2::new(x0 + gx as f32 * s, y0 + gy as f32 * s));
+        }
+    }
+    let n = blob.len();
+    let gravity = Vec2::new(0.0, 6.0);
+    let frame_subs = 480usize; // 1 s per printed row
+    let snapshots = [0usize, 240, 480, 960, 1440, 2400]; // substeps to snapshot
+
+    for strat in [Strategy::Mlsmpm, Strategy::Dfsph] {
+        let (_tx, rx) = channel();
+        let mut physics = Physics::new(blob.clone(), vec![Vec2::ZERO; n], rx, 2000.0);
+        physics.set_adaptive_dt(false);
+        physics.set_strategy(strat);
+        physics.set_gravity(gravity);
+        let mut share = ShareData {
+            c_pos: blob.clone(),
+            c_color: vec![0.0; n],
+            ..Default::default()
+        };
+
+        println!("\n=== {strat:?} ({n} particles, blob drop) ===");
+        println!("  substep |  com_y | top_y | bot_y | width | height | mean_v |  max_v | rho/J");
+        let mut step = 0usize;
+        let max_step = *snapshots.last().unwrap();
+        while step <= max_step {
+            // Snapshot metrics + frame at chosen substeps.
+            if snapshots.contains(&step) {
+                let (mut minx, mut maxx, mut miny, mut maxy, mut sumy) =
+                    (f32::MAX, f32::MIN, f32::MAX, f32::MIN, 0.0f64);
+                for p in &share.c_pos {
+                    minx = minx.min(p.x);
+                    maxx = maxx.max(p.x);
+                    miny = miny.min(p.y);
+                    maxy = maxy.max(p.y);
+                    sumy += p.y as f64;
+                }
+                let ps = &share.perf_stats;
+                println!(
+                    "  {step:7} | {:6.0} | {:5.0} | {:5.0} | {:5.0} | {:6.0} | {:6.1} | {:6.1} | {:.3}",
+                    sumy / n as f64,
+                    miny,
+                    maxy,
+                    maxx - minx,
+                    maxy - miny,
+                    ps.mean_speed,
+                    ps.max_speed,
+                    ps.pbf_density_ratio,
+                );
+                let mut canvas = Canvas::new(PANEL_W, PANEL_H);
+                draw_panel(&mut canvas, 0, 0, &share);
+                let path = format!("renders/diag_{}_{:04}.png", strat.token(), step);
+                png_write(&path, PANEL_W, PANEL_H, &canvas.px, &pal);
+            }
+            physics.step(PHYS_TIME_STEP, &mut share);
+            step += 1;
+        }
+        let _ = frame_subs;
+    }
+    println!("\nframes: renders/diag_<solver>_<substep>.png");
+}
+
+// ---------------------------------------------------------------------------
 // Performance comparison (sequential; one solver at a time so the numbers are
 // clean). Times each strategy on each scenario's initial state and reports the
 // wall-clock cost per 480 Hz substep.
@@ -1606,11 +1683,12 @@ fn perf_mode() {
                 "—".to_string()
             };
             println!(
-                "| {} | {n} | {} | {:.3} | {:.0} | {rel} |",
+                "| {} | {n} | {} | {:.3} | {:.0} | {rel} | {:.3} |",
                 scenario.name,
                 strat.token(),
                 ms,
                 1000.0 / ms,
+                share.perf_stats.pbf_density_ratio,
             );
         }
     }
@@ -1654,9 +1732,17 @@ fn webp_mode() {
     let pal = build_palette();
     let out_dir = "renders";
     std::fs::create_dir_all(out_dir).unwrap();
+    // Optional strategy filter: `--webp <token>` re-renders only that solver.
+    let only: Option<Strategy> = std::env::args()
+        .skip_while(|a| a != "--webp")
+        .nth(1)
+        .and_then(|t| Strategy::parse(&t));
     println!("panels {PANEL_W}x{PANEL_H}, {FRAMES} frames @ {FPS} fps");
     for scenario in scenarios() {
         for &strat in Strategy::all() {
+            if only.is_some_and(|s| s != strat) {
+                continue;
+            }
             let t = std::time::Instant::now();
             let frames = simulate(&scenario, strat);
             let path = format!("{out_dir}/{}_{}.webp", scenario.name, strat.token());
@@ -1671,6 +1757,10 @@ fn webp_mode() {
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--mpm-diag") {
+        mpm_diag();
+        return;
+    }
     if std::env::args().any(|a| a == "--perf") {
         perf_mode();
         return;

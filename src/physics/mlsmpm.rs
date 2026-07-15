@@ -66,15 +66,16 @@ pub struct MpmParams {
 
 impl Default for MpmParams {
     fn default() -> Self {
-        // Swept against the drop-and-settle test (mpm_bulk_sweep): the stiffness
-        // must balance this codebase's large effective gravity (accel ≈ 4700).
-        // At bulk ≥ 5e4 a dropped blob spreads into a thin floor puddle with the
-        // interior volume ratio J ≈ 0.97 (incompressible); 2e5 sits comfortably
-        // below the CFL limit (stable even at 1e6). Shear (jelly only) is set an
+        // The stiffness E in the linear EOS E·(J−1) must resist the *dynamic*
+        // pressure of an impact under this engine's large effective gravity
+        // (accel ≈ 4700): a blob hitting the floor at ~2400 px/s has ½ρv² ≈ 3e6,
+        // so a soft E collapses the volume and pancakes. E ≈ 1e7 holds the
+        // impact to ~15–25% compression while staying well under the CFL ceiling
+        // (sound speed √E ≈ 3160, √E·Δt/Δx ≈ 0.55). Shear (jelly only) is set an
         // order below so a jelly wobbles and holds shape without locking up.
         Self {
             material: MpmMaterial::Liquid,
-            bulk: 2.0e5,
+            bulk: 1.0e7,
             shear: 4.0e4,
         }
     }
@@ -158,18 +159,24 @@ impl Mlsmpm {
         let pre = -dt * P_VOL * 4.0 * MPM_INV_DX * MPM_INV_DX;
         let stress = match self.params.material {
             MpmMaterial::Liquid => {
-                // Equation of state on J: pressure ∝ λ·J·(J−1) (isotropic).
+                // Linear equation of state (mpm88): pressure = E·(J−1),
+                // isotropic. Unlike λ·J·(J−1) this keeps a *finite* restoring
+                // force as J→0 (E·(J−1) → −E), so a hard impact can't collapse
+                // the volume to a pressureless pancake — J self-corrects.
                 let j = self.jdet[p];
-                Mat2::IDENTITY * (self.params.bulk * j * (j - 1.0))
+                Mat2::IDENTITY * (self.params.bulk * (j - 1.0))
             }
             MpmMaterial::Jelly => {
                 // Fixed-corotated: σ = 2μ(F−R)Fᵀ + λ·J·(J−1)·I, R from the 2D
-                // polar decomposition of F (closed form, no SVD).
+                // polar decomposition of F (closed form, no SVD). λ is tied to
+                // the shear μ (λ ≈ 5μ, a solid-like Lamé ratio) rather than the
+                // liquid's `bulk`: a λ ≫ μ would swamp the shear and the jelly
+                // would flow like a fluid instead of holding its shape.
                 let f = self.fmat[p];
                 let j = f.determinant();
                 let r = polar_rotation(f);
                 let mu = self.params.shear;
-                let la = self.params.bulk;
+                let la = 5.0 * mu;
                 (f - r) * f.transpose() * (2.0 * mu) + Mat2::IDENTITY * (la * j * (j - 1.0))
             }
         };
@@ -247,20 +254,20 @@ impl Mlsmpm {
             clamp_wall(&mut xp);
             x[p] = xp;
 
-            // Evolve the material state by F ← (I + Δt·C)·F.
-            let grad = Mat2::IDENTITY + new_c * dt;
+            // Evolve the material state.
             match self.params.material {
                 MpmMaterial::Liquid => {
-                    // Only J = det(F) matters for a liquid; accumulate it, then
-                    // clamp. Without the clamp a violent compression (e.g. the
-                    // floor impact) drives J→0, where the J·(J−1) EOS gives ~0
-                    // restoring force and J can never recover — the fluid goes
-                    // permanently "pressureless". Clamping keeps the pressure
-                    // strong enough at the extremes to push J back toward 1.
-                    self.jdet[p] = (self.jdet[p] * grad.determinant()).clamp(0.6, 1.4);
+                    // Volume ratio evolves with the velocity divergence (the
+                    // trace of C): J ← J·(1 + Δt·tr C) (mpm88). The linear EOS
+                    // keeps a finite restoring pressure at every J, so J stays
+                    // near 1 on its own — the wide clamp is only a NaN guard
+                    // against a single pathological step, not a physics knob.
+                    let tr = new_c.col(0).x + new_c.col(1).y;
+                    self.jdet[p] = (self.jdet[p] * (1.0 + dt * tr)).clamp(0.1, 3.0);
                 }
                 MpmMaterial::Jelly => {
-                    self.fmat[p] = grad * self.fmat[p];
+                    // F ← (I + Δt·C)·F.
+                    self.fmat[p] = (Mat2::IDENTITY + new_c * dt) * self.fmat[p];
                 }
             }
         }
