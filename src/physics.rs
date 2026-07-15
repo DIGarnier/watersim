@@ -1321,7 +1321,6 @@ const PBF_H2: f32 = PBF_H * PBF_H;
 // roughly the same packing a granular pile settles to, so the two models fill
 // comparable volume for a given particle count.
 const PBF_REST_SPACING: f32 = 2.0 * BALL_SIZE;
-const PBF_SCORR_N: i32 = 4;
 
 /// Tunable PBF coefficients. Defaults were swept with the render tool's
 /// `--stats` diagnostic; note the values are *not* the paper's textbook
@@ -1341,6 +1340,8 @@ pub struct PbfParams {
     pub scorr_k: f32,
     /// s_corr reference distance Δq (the kernel is sampled here for the ratio).
     pub scorr_dq: f32,
+    /// s_corr exponent n. Higher = sharper/shorter-range repulsion.
+    pub scorr_n: i32,
     /// XSPH viscosity coefficient (velocity smoothing toward the neighborhood).
     pub xsph_c: f32,
     /// Vorticity-confinement strength (re-injects swirl the solver damps).
@@ -1368,8 +1369,18 @@ impl Default for PbfParams {
         Self {
             iters: 6,
             eps_cfm: 2.0e-3,
-            scorr_k: 3.0,
+            // The sloshing benchmark's --damp-sweep found s_corr (an always-on
+            // repulsion) to be the *dominant* slosh damper — at the paper's n=4
+            // it is still significant at the rest spacing, so it jiggles resting
+            // fluid and bleeds coherent wave energy. Sharpening it (n=8) makes it
+            // near-zero at rest but still strong where particles actually clump,
+            // decoupling anti-clumping from damping: vs the original n=4/k=3 this
+            // is livelier (slosh decay ×0.40 → ×0.50, ~1 extra cycle) AND flatter
+            // (0% clumped, vs 1%). n is a paper parameter (Macklin & Müller eq.
+            // 13 use 4); raising it for this trade-off is our own calibration.
+            scorr_k: 5.0,
             scorr_dq: 0.2 * PBF_H,
+            scorr_n: 8,
             // 0.05, not 0.1: the sloshing benchmark showed 0.1 over-damped free
             // oscillation (amplitude ×0.27/half-period) without improving the
             // settle. Halving it lets a slosh persist ~2× longer (period still
@@ -1647,6 +1658,7 @@ impl Pbf {
         let inv_rho0 = 1.0 / rho0;
         let eps_cfm = self.params.eps_cfm;
         let scorr_k = self.params.scorr_k;
+        let scorr_n = self.params.scorr_n;
         let max_corr = self.params.max_corr;
         let lambda_max = self.params.lambda_max;
 
@@ -1695,7 +1707,7 @@ impl Pbf {
                         return;
                     }
                     let d = xi - x_ro[j];
-                    let scorr = scorr(d.length_squared(), scorr_denom, scorr_k);
+                    let scorr = scorr(d.length_squared(), scorr_denom, scorr_k, scorr_n);
                     corr += grad_spiky(d) * (lami + lambda[j] + scorr);
                 });
                 let mut c = corr * inv_rho0;
@@ -1809,11 +1821,15 @@ impl Pbf {
 const INV_PHYS_DT_MULT: f32 = 1.0 / PHYS_TIME_STEP;
 
 /// s_corr artificial-pressure term: −k (W(r)/W(Δq))^n. `denom` = W_poly6(Δq²).
+/// A larger `n` sharpens the term toward short range: it stays strong where
+/// particles clump (r ≪ Δq) but decays to near-zero at the rest spacing, so it
+/// no longer jiggles resting/sloshing fluid — decoupling anti-clumping from the
+/// numerical damping it used to add.
 #[inline(always)]
-fn scorr(r2: f32, denom: f32, k: f32) -> f32 {
+fn scorr(r2: f32, denom: f32, k: f32, n: i32) -> f32 {
     let ratio = w_poly6(r2) / denom;
     let mut p = ratio;
-    for _ in 1..PBF_SCORR_N {
+    for _ in 1..n.max(1) {
         p *= ratio;
     }
     -k * p
