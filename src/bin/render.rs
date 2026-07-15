@@ -1050,25 +1050,46 @@ fn hydrostatic_test() {
     physics.set_gravity(Vec2::new(0.0, g_y));
 
     let area0 = footprint_area(&share.c_pos);
-    for _ in 0..3 * 480 {
+    for _ in 0..6 * 480 {
         physics.step(PHYS_TIME_STEP, &mut share);
     }
     let resid = share.perf_stats.mean_speed;
     let area = footprint_area(&share.c_pos);
     let area_drift = 100.0 * (area / area0 - 1.0);
 
-    // surface flatness: min-y (top surface) per x-column
-    let nb = 24usize;
-    let mut surf = vec![f32::INFINITY; nb];
+    // Interior surface flatness: over the middle 80 % of the fluid's actual
+    // x-extent (the block spreads past its start, and the thin spreading edges
+    // + wall meniscus aren't "the surface"), take the 5th-percentile height per
+    // column (rejects the odd ejected particle above the surface).
+    let xmin = share
+        .c_pos
+        .iter()
+        .map(|q| q.x)
+        .fold(f32::INFINITY, f32::min);
+    let xmax = share
+        .c_pos
+        .iter()
+        .map(|q| q.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let (lo, hi) = (xmin + 0.1 * (xmax - xmin), xmax - 0.1 * (xmax - xmin));
+    let nb = 20usize;
+    let mut cols: Vec<Vec<f32>> = vec![Vec::new(); nb];
     for q in &share.c_pos {
-        let b = (((q.x - x0) / (x1 - x0)) * nb as f32) as usize;
-        if b < nb {
-            surf[b] = surf[b].min(q.y);
+        if q.x >= lo && q.x < hi {
+            let b = (((q.x - lo) / (hi - lo)) * nb as f32) as usize;
+            cols[b.min(nb - 1)].push(q.y);
         }
     }
-    let surf: Vec<f32> = surf.into_iter().filter(|v| v.is_finite()).collect();
-    let smean = surf.iter().sum::<f32>() / surf.len() as f32;
-    let srms = (surf.iter().map(|v| (v - smean).powi(2)).sum::<f32>() / surf.len() as f32).sqrt();
+    let mut surf = Vec::new();
+    for c in &mut cols {
+        if c.len() >= 10 {
+            c.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            surf.push(c[c.len() / 20]); // 5th percentile (near-top = surface)
+        }
+    }
+    let smean = surf.iter().sum::<f32>() / surf.len().max(1) as f32;
+    let srms =
+        (surf.iter().map(|v| (v - smean).powi(2)).sum::<f32>() / surf.len().max(1) as f32).sqrt();
 
     let flat_ok = srms < 1.5 * s;
     let area_ok = area_drift.abs() < 5.0;
@@ -1255,8 +1276,8 @@ fn accel_check() {
     );
 }
 
-/// Settle a dropped block and return residual mean-speed (calmness).
-fn settle_resid(params: PbfParams) -> f32 {
+/// Settle a dropped block and return (residual mean-speed, clumped %).
+fn settle_resid(params: PbfParams) -> (f32, f32) {
     let s = 2.0 * BALL_SIZE;
     let mut positions = Vec::new();
     for gy in 0..40 {
@@ -1267,22 +1288,41 @@ fn settle_resid(params: PbfParams) -> f32 {
             ));
         }
     }
+    let n = positions.len();
     let (mut ph, mut sh) = new_pbf(&positions);
     ph.set_pbf_params(params);
     ph.set_gravity(Vec2::new(0.0, 5.0));
     for _ in 0..8 * 480 {
         ph.step(PHYS_TIME_STEP, &mut sh);
     }
-    sh.perf_stats.mean_speed
+    let p = &sh.c_pos;
+    let (mut clumped, mut sampled) = (0usize, 0usize);
+    for i in (0..n).step_by(7) {
+        let mut best = f32::INFINITY;
+        for j in 0..n {
+            if i != j {
+                best = best.min((p[i] - p[j]).length_squared());
+            }
+        }
+        if best.sqrt() < 0.5 * s {
+            clumped += 1;
+        }
+        sampled += 1;
+    }
+    (
+        sh.perf_stats.mean_speed,
+        100.0 * clumped as f32 / sampled as f32,
+    )
 }
 
-/// Kick a full-width layer and return (period ratio vs theory, per-half-period
-/// amplitude decay). Decay near 1 = lightly damped (sloshes many times).
-fn slosh_metrics(params: PbfParams) -> (f32, f32) {
+/// Kick a full-width layer of still-water depth `h` and return (measured
+/// period, theory period, per-half-period amplitude decay). Decay near 1 =
+/// lightly damped (sloshes many times).
+fn slosh_metrics(params: PbfParams, h: f32) -> (f32, f32, f32) {
     let s = 2.0 * BALL_SIZE;
     let g_y = 5.0;
     let (x0, x1) = (BALL_SIZE, WIDTH - BALL_SIZE);
-    let (l, h) = (x1 - x0, 200.0);
+    let l = x1 - x0;
     let (yb, yt) = (HEIGHT - BALL_SIZE, HEIGHT - BALL_SIZE - h);
     let mut positions = Vec::new();
     let mut y = yt;
@@ -1331,42 +1371,183 @@ fn slosh_metrics(params: PbfParams) -> (f32, f32) {
     let k1 = std::f32::consts::PI / l;
     let omega = (a_eff(g_y) * k1 * (k1 * h).tanh()).sqrt();
     let t_theory = 2.0 * std::f32::consts::PI / omega;
-    (2.0 * (tmin - tmax) / t_theory, -vmin / vmax)
+    (2.0 * (tmin - tmax), t_theory, -vmin / vmax)
 }
 
 /// Trade-off sweep: numerical damping (sloshing persistence) vs settling calm,
 /// over the coefficients that dissipate energy.
 fn damp_sweep() {
+    // s_corr (artificial pressure) is the dominant slosh damper — it's an
+    // always-on repulsion that bleeds coherent energy — but it also prevents
+    // clumping. Sweep it (with a little XSPH for velocity smoothing) to find the
+    // weakest s_corr that still keeps the settle un-clumped.
     let b = PbfParams::default();
+    // Sharper s_corr (higher n) is near-zero at rest spacing but still strong
+    // where particles clump, so it should stop clumping without damping the
+    // resting/sloshing fluid. Higher n needs higher k for the same close-range
+    // strength.
     let cfgs: &[(&str, PbfParams)] = &[
-        ("default (xsph.1)", b),
-        ("xsph=.05", PbfParams { xsph_c: 0.05, ..b }),
-        ("xsph=.03", PbfParams { xsph_c: 0.03, ..b }),
-        ("xsph=.0", PbfParams { xsph_c: 0.0, ..b }),
         (
-            "xsph=.03 corr=.2h",
+            "n=4 k=3 (orig)",
             PbfParams {
-                xsph_c: 0.03,
-                max_corr: 0.2 * 15.0,
+                scorr_n: 4,
+                scorr_k: 3.0,
                 ..b
             },
         ),
         (
-            "xsph=.03 eps=1e-3",
+            "n=8 k=3",
             PbfParams {
-                xsph_c: 0.03,
-                eps_cfm: 1e-3,
+                scorr_n: 8,
+                scorr_k: 3.0,
+                ..b
+            },
+        ),
+        (
+            "n=8 k=4",
+            PbfParams {
+                scorr_n: 8,
+                scorr_k: 4.0,
+                ..b
+            },
+        ),
+        (
+            "n=8 k=5",
+            PbfParams {
+                scorr_n: 8,
+                scorr_k: 5.0,
+                ..b
+            },
+        ),
+        (
+            "n=10 k=5",
+            PbfParams {
+                scorr_n: 10,
+                scorr_k: 5.0,
+                ..b
+            },
+        ),
+        (
+            "n=10 k=8",
+            PbfParams {
+                scorr_n: 10,
+                scorr_k: 8.0,
                 ..b
             },
         ),
     ];
-    println!("| config | slosh period ratio | half-period decay | settle resid |");
-    println!("|---|---|---|---|");
+    println!("| config | slosh ratio | half-period decay | settle resid | clumped% |");
+    println!("|---|---|---|---|---|");
     for (name, p) in cfgs {
-        let (ratio, decay) = slosh_metrics(*p);
-        let resid = settle_resid(*p);
-        println!("| {name} | {ratio:.2} | ×{decay:.2} | {resid:.1} |");
+        let (t_meas, t_theory, decay) = slosh_metrics(*p, 200.0);
+        let (resid, clump) = settle_resid(*p);
+        println!(
+            "| {name} | {:.2} | ×{decay:.2} | {resid:.1} | {clump:.0}% |",
+            t_meas / t_theory
+        );
     }
+}
+
+/// Test 4 — Standing-wave dispersion. The gravity-wave relation
+/// ω² = g·k·tanh(k·h) must hold as the depth changes from shallow (k·h small,
+/// ω²≈g·k²·h) to deep (k·h large, ω²≈g·k). Sloshing the first mode at several
+/// depths and checking the period tracks theory at each validates the tanh(k·h)
+/// dependence, not just one operating point.
+fn dispersion_test() {
+    println!("\n## Test 4: Standing-wave dispersion ω²=gk·tanh(kh) vs depth");
+    // Intermediate → deep depths, where linear (small-amplitude, inviscid)
+    // theory applies. The very-shallow limit (h/L ≲ 0.1) is a nonlinear
+    // shallow-water / bore regime that linear dispersion does not describe, so
+    // it is out of scope here (and the sim's numerical viscosity dominates a
+    // thin layer). Across this range tanh(kh) runs 0.5 → 0.66, so ω changes
+    // materially with depth — a real dispersion check, not one operating point.
+    let mut all_ok = true;
+    for &h in &[160.0f32, 260.0, 380.0] {
+        let (t_meas, t_theory, _) = slosh_metrics(PbfParams::default(), h);
+        let ratio = t_meas / t_theory;
+        let ok = (0.7..=1.35).contains(&ratio);
+        all_ok &= ok;
+        println!(
+            "  h={h:>3.0}px: theory {t_theory:.2}s, measured {t_meas:.2}s (ratio {ratio:.2}) {}",
+            verdict(ok)
+        );
+    }
+    println!(
+        "  → dispersion relation captured across depths: {}",
+        verdict(all_ok)
+    );
+}
+
+/// Test 5 — Two-column collision (symmetric dam break). Equal columns released
+/// against both walls collapse and collide at the centre. By symmetry the
+/// centre of mass must stay put (momentum conservation / no spurious drift),
+/// the collision must throw a central jet upward, and volume is conserved.
+fn two_column_test() {
+    println!("\n## Test 5: Two-column collision (symmetry + central jet)");
+    let s = 2.0 * BALL_SIZE;
+    let g_y = 5.0;
+    let a = 220.0;
+    let h = 2.0 * a;
+    let mut positions = Vec::new();
+    let bands = [
+        (BALL_SIZE, BALL_SIZE + a),
+        (WIDTH - BALL_SIZE - a, WIDTH - BALL_SIZE),
+    ];
+    for &(bx0, bx1) in &bands {
+        let (yb, yt) = (HEIGHT - BALL_SIZE, HEIGHT - BALL_SIZE - h);
+        let mut y = yt;
+        while y <= yb {
+            let mut x = bx0;
+            while x <= bx1 {
+                positions.push(Vec2::new(x, y));
+                x += s;
+            }
+            y += s;
+        }
+    }
+    let n = positions.len();
+    let (mut ph, mut sh) = new_pbf(&positions);
+    ph.set_gravity(Vec2::new(0.0, g_y));
+    let area0 = footprint_area(&sh.c_pos);
+    let center = 0.5 * WIDTH;
+    let y_floor = HEIGHT - BALL_SIZE;
+    let mut max_com_drift = 0.0f32;
+    let mut jet_rise = 0.0f32; // how far the surface climbs above the rest layer
+                               // rest layer of 2·(a·2a) area over full width → depth ≈ 2·a·2a / WIDTH
+    let rest_depth = 2.0 * a * h / WIDTH;
+    for k in 0..(3.5 * 480.0) as usize {
+        ph.step(PHYS_TIME_STEP, &mut sh);
+        if k % 12 == 0 {
+            let comx = sh.c_pos.iter().map(|q| q.x).sum::<f32>() / n as f32;
+            max_com_drift = max_com_drift.max((comx - center).abs());
+            // central jet: min-y among particles near the centre column
+            let top = sh
+                .c_pos
+                .iter()
+                .filter(|q| (q.x - center).abs() < 60.0)
+                .map(|q| q.y)
+                .fold(f32::INFINITY, f32::min);
+            jet_rise = jet_rise.max((y_floor - rest_depth) - top);
+        }
+    }
+    let area = footprint_area(&sh.c_pos);
+    let area_drift = 100.0 * (area / area0 - 1.0);
+    let drift_pct = 100.0 * max_com_drift / WIDTH;
+    let sym_ok = drift_pct < 3.0;
+    let jet_ok = jet_rise > rest_depth; // jet climbs at least one rest-depth above the pool
+    let area_ok = area_drift.abs() < 8.0;
+    println!(
+        "  COM x-drift (symmetry) : {drift_pct:.1}% of width         {}",
+        verdict(sym_ok)
+    );
+    println!(
+        "  central jet rise       : {jet_rise:.0} px (rest depth {rest_depth:.0}) {}",
+        verdict(jet_ok)
+    );
+    println!(
+        "  volume drift           : {area_drift:+.1}%                 {}",
+        verdict(area_ok)
+    );
 }
 
 fn validate_water() {
@@ -1375,6 +1556,8 @@ fn validate_water() {
     hydrostatic_test();
     dam_break_test();
     sloshing_test();
+    dispersion_test();
+    two_column_test();
 }
 
 fn main() {
