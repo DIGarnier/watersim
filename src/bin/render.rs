@@ -1639,6 +1639,63 @@ fn mpm_diag() {
 }
 
 // ---------------------------------------------------------------------------
+// Behaviour comparison: drive each scenario for the clip length and report how
+// each solver *behaves* — peak speed (how lively/splashy), the settled residual
+// speed (how much it damps), and its incompressibility (mean ρ/ρ0 for the SPH
+// fluids, mean J for MPM; granular is not a fluid). Same speed metric as the
+// particle colour.
+// ---------------------------------------------------------------------------
+
+fn behavior_mode() {
+    println!("# Solver behaviour (over the clip: {FRAMES} frames)");
+    println!("| scenario | solver | peak speed | settles to | incompressibility |");
+    println!("|---|---|---|---|---|");
+    for scenario in scenarios() {
+        let n = scenario.positions.len();
+        for &strat in Strategy::all() {
+            let (_tx, rx) = channel();
+            let mut physics =
+                Physics::new(scenario.positions.clone(), vec![Vec2::ZERO; n], rx, 2000.0);
+            physics.set_adaptive_dt(false);
+            physics.set_strategy(strat);
+            let mut share = ShareData {
+                c_pos: scenario.positions.clone(),
+                c_color: vec![0.0; n],
+                ..Default::default()
+            };
+            let mut peak = 0.0f32;
+            let mut rho_sum = 0.0f64;
+            let mut rho_cnt = 0usize;
+            for frame in 0..FRAMES {
+                physics.set_gravity((scenario.gravity)(frame));
+                for _ in 0..SUBSTEPS_PER_FRAME {
+                    physics.step(PHYS_TIME_STEP, &mut share);
+                    peak = peak.max(share.perf_stats.max_speed);
+                    let r = share.perf_stats.pbf_density_ratio;
+                    if r > 0.0 {
+                        rho_sum += r as f64;
+                        rho_cnt += 1;
+                    }
+                }
+            }
+            let incomp = if rho_cnt > 0 {
+                format!("{:.3}", rho_sum / rho_cnt as f64)
+            } else {
+                "—".to_string()
+            };
+            println!(
+                "| {} | {} | {:.0} | {:.1} | {} |",
+                scenario.name,
+                strat.token(),
+                peak,
+                share.perf_stats.mean_speed,
+                incomp,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Performance comparison (sequential; one solver at a time so the numbers are
 // clean). Times each strategy on each scenario's initial state and reports the
 // wall-clock cost per 480 Hz substep.
@@ -1759,6 +1816,10 @@ fn webp_mode() {
 fn main() {
     if std::env::args().any(|a| a == "--mpm-diag") {
         mpm_diag();
+        return;
+    }
+    if std::env::args().any(|a| a == "--behavior") {
+        behavior_mode();
         return;
     }
     if std::env::args().any(|a| a == "--perf") {
