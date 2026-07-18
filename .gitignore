@@ -1,1 +1,8 @@
 /target
+
+# Generated render outputs (reproducible via `render --webp` / the default gif
+# mode / the diagnostics). The tracked renders/settle.png is the one sample.
+/renders/*.webp
+/renders/*.gif
+/renders/*.png
+!/renders/settle.png
