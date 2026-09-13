@@ -1267,10 +1267,13 @@ dependencies = [
 name = "lolballs"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "ggez",
  "glam",
+ "pollster",
  "rayon",
  "webp",
+ "wgpu",
 ]
 
 [[package]]

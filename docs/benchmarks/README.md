@@ -26,6 +26,9 @@ Final report with baseline→final tables:
 | 24 | [24-cluster-force-gather-rejected.md](24-cluster-force-gather-rejected.md) | clustering the packed *force* gather (index-range masks) | **rejected**: ~15 % slower — kernel is FLOP-bound (no cutoff), no idle lanes to reclaim |
 | 25 | [25-cutoff-model.md](25-cutoff-model.md) | **model decision**: compact-support repulsion (cutoff 2.5 radii, C¹ taper); Barnes-Hut machinery + dead code removed | grid paths −10…−20 %; default mode 2.3–2.6× (was the BH path); max pen 0.0 % ≥ 3k; stencil validated exact vs O(n²) |
 | 26 | [26-unified-model-tuning.md](26-unified-model-tuning.md) | pass 3: crossover re-swept 22k→14k; packed solver double-buffered (no apply sweep); parallel grid-build cell-id pass | 24k packed engine −26 % verlet / −12 % spatial; contact quality unchanged |
+| 27 | [27-gpu-metal.md](27-gpu-metal.md) | fully GPU-resident integration, atomic grid, force and contact kernels through wgpu/Metal | M5 live path: 1.13× at 15k, **1.75–1.88× at 50k**; strict per-step readback rejected |
+| 28 | [28-zero-copy-render.md](28-zero-copy-render.md) | direct instanced rendering plus fused O(N) million-particle flow; one command buffer/frame | M5: 1M at 120 FPS; 4M at 64–70 FPS, with zero particle readbacks |
+| 29 | [29-massive-particles.md](29-massive-particles.md) | 64-bit normalized state, two storage shards, GPU initialization, hardware points, rotating simulation/render cohorts | M5: 8M at 120 FPS; ≈16M at 54–80 FPS; **33.6M at 47–55 FPS sustained** |
 
 Net (mean µs/step, defaults, same-day A/B chains): BH path 2.5–4.2× faster;
 grid paths ~1.4× at solver-dominated sizes, another ~1.3× from stages
@@ -92,10 +95,9 @@ neighbor lists during fast motion; 06 fixed that (see its write-up).
 
 ## Where the remaining time goes / follow-ups
 
-- **Barnes-Hut** is θ-limited arithmetic: at θ = 0.5 with a global 1/r² force each
-  particle legitimately touches hundreds of nodes. Options: raise θ (accuracy trade),
-  fast multipole, or the GPU compute path (`resources/physics_compute.wgsl` exists
-  but was never wired up).
+- The direct GPU path is now the standard-build default; stages 27–28 move both
+  physics and particle rendering onto one device and remove CPU transform
+  uploads from the live loop.
 - **Proper Small Steps**: raising the substep rate while dropping to 1 iteration
   needs the integrator's `a·dt` term fixed to `a·dt²` first (see 04).
 - **SFC particle reordering** is now in (stage 07), measured neutral ≤24k as

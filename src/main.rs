@@ -14,9 +14,12 @@ use ggez::winit::event::VirtualKeyCode;
 use ggez::{event, graphics, Context, ContextBuilder, GameResult};
 use physics::{EventToPthread, Physics, ShareData, Strategy, PHYS_TIME_STEP};
 
+#[cfg(feature = "gpu")]
+mod gpu_app;
+
 const BACKGROUND_COLOR: Color = Color::new(0., 0., 0., 0.0);
 
-/// Parse `--sim granular|pbf` (default granular) from the command line.
+/// Parse `--sim gpu|granular|pbf|dfsph|mlsmpm` (default GPU when enabled).
 fn parse_strategy() -> Strategy {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -34,7 +37,7 @@ fn parse_strategy() -> Strategy {
             }
         }
     }
-    Strategy::Granular
+    Strategy::default()
 }
 
 fn main() -> GameResult {
@@ -45,6 +48,10 @@ fn main() -> GameResult {
         .collect::<Vec<_>>()
         .join("|");
     println!("fluid model: {strategy:?}  (switch with --sim {choices})");
+    #[cfg(feature = "gpu")]
+    if strategy == Strategy::Gpu {
+        gpu_app::run();
+    }
     let (mut ctx, events_loop) = ContextBuilder::new("ballz", "ggez")
         .window_setup(WindowSetup::default().vsync(false))
         .window_mode(WindowMode::default().dimensions(WIDTH, HEIGHT))
@@ -138,14 +145,26 @@ fn main() -> GameResult {
     });
 
     let to_draw_thread = Arc::clone(&share_data);
-    let state = MainState::new(&mut ctx, to_draw_thread, tx)?;
+    let state = MainState::new(
+        &mut ctx,
+        Simulation::Cpu {
+            share: to_draw_thread,
+            tx,
+        },
+    )?;
     event::run(ctx, events_loop, state)
 }
 
+enum Simulation {
+    Cpu {
+        share: Arc<Mutex<ShareData>>,
+        tx: Sender<EventToPthread>,
+    },
+}
+
 struct MainState {
-    share: Arc<Mutex<ShareData>>,
+    simulation: Simulation,
     shader: graphics::Shader,
-    tx: Sender<EventToPthread>,
     circles: InstanceArray,
     circle: Mesh,
     nb_obj: usize,
@@ -155,11 +174,7 @@ struct MainState {
 }
 
 impl MainState {
-    fn new(
-        ctx: &mut Context,
-        share: Arc<Mutex<ShareData>>,
-        tx: Sender<EventToPthread>,
-    ) -> GameResult<MainState> {
+    fn new(ctx: &mut Context, simulation: Simulation) -> GameResult<MainState> {
         let shader = graphics::ShaderBuilder::new()
             .fragment_path("/blur.wgsl")
             .build(&ctx.gfx)?;
@@ -175,9 +190,8 @@ impl MainState {
         let circles = InstanceArray::new(ctx, None);
 
         Ok(MainState {
-            share,
+            simulation,
             shader,
-            tx,
             circles,
             circle,
             nb_obj: 0,
@@ -196,8 +210,9 @@ impl MainState {
 
 impl event::EventHandler<ggez::GameError> for MainState {
     fn update(&mut self, ctx: &mut Context) -> GameResult {
+        let Simulation::Cpu { share, tx } = &self.simulation;
         while ctx.time.check_update_time(60) {
-            let Ok(share_data) = self.share.lock() else {
+            let Ok(share_data) = share.lock() else {
                 return Ok(());
             };
 
@@ -219,9 +234,7 @@ impl event::EventHandler<ggez::GameError> for MainState {
             self.nb_obj = share_data.c_pos.len();
 
             if let (Some(start), Some(cannon)) = (self.mouse_start_pos, self.cannon) {
-                self.tx
-                    .send(EventToPthread::Cannon((start, cannon)))
-                    .unwrap()
+                tx.send(EventToPthread::Cannon((start, cannon))).unwrap()
             }
         }
 
@@ -235,12 +248,13 @@ impl event::EventHandler<ggez::GameError> for MainState {
         _repeated: bool,
     ) -> GameResult {
         const SCALER: f32 = 100.0;
+        let Simulation::Cpu { tx, .. } = &self.simulation;
         match input.keycode {
-            Some(VirtualKeyCode::W) => self.tx.send(EventToPthread::Scale(SCALER)).unwrap(),
-            Some(VirtualKeyCode::S) => self.tx.send(EventToPthread::Scale(-SCALER)).unwrap(),
+            Some(VirtualKeyCode::W) => tx.send(EventToPthread::Scale(SCALER)).unwrap(),
+            Some(VirtualKeyCode::S) => tx.send(EventToPthread::Scale(-SCALER)).unwrap(),
             // Toggle optimization techniques
-            Some(VirtualKeyCode::V) => self.tx.send(EventToPthread::ToggleVerletLists).unwrap(),
-            Some(VirtualKeyCode::A) => self.tx.send(EventToPthread::ToggleAdaptiveDt).unwrap(),
+            Some(VirtualKeyCode::V) => tx.send(EventToPthread::ToggleVerletLists).unwrap(),
+            Some(VirtualKeyCode::A) => tx.send(EventToPthread::ToggleAdaptiveDt).unwrap(),
             _ => (),
         };
 
@@ -304,10 +318,11 @@ impl event::EventHandler<ggez::GameError> for MainState {
         let nb_obj = self.nb_obj;
 
         // Get performance stats from share data
-        let perf_stats = if let Ok(share) = self.share.lock() {
-            share.perf_stats.clone()
-        } else {
-            Default::default()
+        let perf_stats = match &self.simulation {
+            Simulation::Cpu { share, .. } => share
+                .lock()
+                .map(|share| share.perf_stats.clone())
+                .unwrap_or_default(),
         };
 
         let fps_display = Text::new(format!(
@@ -318,6 +333,8 @@ impl event::EventHandler<ggez::GameError> for MainState {
             [A] Adaptive dt: {}\n\
             \n\
             Performance:\n\
+            Compute: {}\n\
+            GPU submit/sync: {}µs\n\
             Integration: {}µs\n\
             Collision: {}µs\n\
             Current dt: {:.6}s\n\
@@ -340,6 +357,8 @@ impl event::EventHandler<ggez::GameError> for MainState {
             } else {
                 "OFF"
             },
+            if perf_stats.gpu_enabled { "GPU" } else { "CPU" },
+            perf_stats.gpu_compute_time_us,
             perf_stats.integration_time_us,
             perf_stats.collision_time_us,
             perf_stats.current_dt,

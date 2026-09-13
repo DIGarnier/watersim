@@ -1,14 +1,15 @@
 # watersim
 
 A real-time particle water simulation built from techniques in the particle
-simulation literature, with every optimization measured before adoption.
+simulation literature. The default engine is a GPU-resident compute pipeline
+that runs through Metal on Apple silicon.
 
 ## The model(s)
 
-Four selectable particle-fluid models (`--sim granular|pbf|dfsph|mlsmpm`,
-default granular), each a self-contained *strategy* chosen once at startup.
-They span three method families; see [docs/solvers.md](docs/solvers.md) for the
-architecture and the evaluation behind the choice.
+Five selectable solver strategies (`--sim gpu|granular|pbf|dfsph|mlsmpm`,
+default `gpu` in the standard build) cover four numerical models and two
+granular backends. See [docs/solvers.md](docs/solvers.md) for the architecture
+and the evaluation behind the choice.
 
 - **Granular** (PBD) — local pressure-like repulsion with compact support
   (cutoff = 2.5 particle radii, smoothly tapered to zero), position-based
@@ -16,6 +17,12 @@ architecture and the evaluation behind the choice.
   stacks and slumps like a pile of balls. O(n) per step via a counting-sort CSR
   grid whose cell size equals the interaction cutoff, making the one-cell
   stencil provably exact (`--validate` checks it against the O(n²) sum).
+- **GPU flow** — the next-generation default. Up to 131k particles use the
+  detailed granular grid/contact model; larger populations switch to a fused
+  O(N) procedural flow kernel designed for millions. The detailed regime uses
+  instanced billboards; the massive regime uses hardware points and rotating
+  cohorts directly from two packed state buffers. On this Mac, `wgpu` maps to
+  Metal; the live path has no particle readback or CPU transform upload.
 - **PBF** (PBD) — Position Based Fluids (Macklin & Müller, SIGGRAPH 2013): the
   same position-projection solver enforces a *density* constraint instead of
   non-penetration, so the particles pour, splash, and slosh as an incompressible
@@ -32,6 +39,11 @@ architecture and the evaluation behind the choice.
 
 ## Optimization techniques (all measured; see docs/benchmarks)
 
+- **Zero-copy GPU pipeline** - integration, atomic spatial bins, force gather,
+  Jacobi contacts, and instanced rendering in one WGSL/wgpu command buffer
+- **Massive-particle compression** - 64-bit normalized position/velocity,
+  two 128 MiB storage shards, GPU-side initialization, one-vertex points, and
+  rotating update/render cohorts
 - **CSR counting-sort grid** - one flat index array, built once per substep
 - **Verlet neighbor lists** - displacement-triggered lazy rebuilds
 - **Multiple time stepping (r-RESPA)** - smooth forces refreshed every 4th substep
@@ -42,21 +54,21 @@ architecture and the evaluation behind the choice.
 
 ## Controls
 
-- **Mouse drag**: Add particles (cannon)
+- **Mouse drag**: Add particles in detailed mode; steer the flow field at scale
 - **W/S**: Increase/decrease force scale
-- **V**: Toggle Verlet neighbor lists
-- **A**: Toggle adaptive time-stepping
+- **V**: Toggle Verlet neighbor lists (legacy CPU granular mode)
+- **A**: Toggle adaptive time-stepping (legacy CPU modes)
 
-Launch flag: `--sim granular|pbf|dfsph|mlsmpm` selects the fluid model
-(default granular).
+Launch flag: `--sim gpu|granular|pbf|dfsph|mlsmpm` selects the fluid model
+(default GPU; use `--sim granular` for the previous CPU implementation).
 
 ## Performance
 
-The simulation displays real-time performance metrics:
+The simulation displays real-time performance metrics in the window title:
 - FPS and particle count
-- Integration and collision timings
-- Active optimization status
-- Current adaptive timestep
+- GPU frame encoding/submission time
+
+Legacy CPU strategies retain the detailed in-window phase HUD.
 
 Measured performance and the full optimization history live in
 [docs/benchmarks/](docs/benchmarks/README.md); the techniques and the papers
@@ -67,6 +79,33 @@ behind them are surveyed in [docs/literature.md](docs/literature.md).
 ```bash
 cargo build --release
 cargo run --release
+```
+
+The direct GPU app starts with 16 million particles and supports up to
+33,554,432. It executes simulation and point rendering in a single command
+buffer per visual frame. Override the starting population with:
+
+```bash
+WATERSIM_SEED_PARTICLES=33554432 cargo run --release
+```
+
+Record five seconds of the real GPU framebuffer to H.264 (requires `ffmpeg`):
+
+```bash
+WATERSIM_SEED_PARTICLES=33554432 \
+WATERSIM_RENDER_PARTICLES=1000000 \
+WATERSIM_RECORD=renders/33m-particles.mp4 \
+cargo run --release
+```
+
+Only the finished framebuffer is read back for recording; particle state stays
+GPU-resident. `WATERSIM_RENDER_PARTICLES` controls the rotating visual sample,
+which is useful when the particle population greatly exceeds the pixel count.
+
+Measure both strict per-step GPU synchronization and the live render-cadence path:
+
+```bash
+cargo run --release --no-default-features --features gpu --bin gpu_bench -- 50000 240
 ```
 
 ## Benchmarking
@@ -81,10 +120,10 @@ cargo bench --no-default-features --bench nbody -- --quick
 
 ## Architecture
 
-- Rust-based physics engine with ggez for rendering
-- Multi-threaded physics simulation
-- Radial blur shader for visual effects
-- Modular optimization system for easy testing
+- Default: one native `winit` + `wgpu` device for Metal compute and direct
+  instanced rendering; particle state never leaves VRAM
+- Legacy modes: the original multi-threaded CPU solvers and ggez renderer
+- Modular solver system and headless CPU/GPU comparison harnesses
 
 ## References
 

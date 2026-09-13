@@ -21,6 +21,8 @@
 //! See `docs/solvers.md` for the survey of these and the methods being added.
 
 mod dfsph;
+#[cfg(feature = "gpu")]
+mod gpu_granular;
 mod granular;
 mod mlsmpm;
 mod pbf;
@@ -32,6 +34,8 @@ use std::sync::mpsc::Receiver;
 use crate::constants::{BALL_SIZE, HEIGHT, INITIAL_BALL_SPEED_MODIFIER, WIDTH};
 
 pub use dfsph::{Dfsph, DfsphParams};
+#[cfg(feature = "gpu")]
+pub use gpu_granular::GpuGranularSolver;
 pub use granular::GranularSolver;
 pub use mlsmpm::{Mlsmpm, MpmMaterial, MpmParams};
 pub use pbf::{Pbf, PbfParams};
@@ -50,6 +54,8 @@ pub(crate) const TOP_WALL: f32 = HEIGHT;
 
 /// Which fluid model the engine runs. Selected once (via `--sim` on the
 /// command line, or [`Physics::set_strategy`]) and kept for the whole run.
+/// Standard graphics builds select [`Strategy::Gpu`] by default;
+/// headless builds without the `gpu` feature retain [`Strategy::Granular`].
 ///
 /// `Granular` is the historical model: a short-range 1/r² repulsion field plus
 /// a hard non-penetration contact projection — it stacks and piles like a
@@ -58,9 +64,8 @@ pub(crate) const TOP_WALL: f32 = HEIGHT;
 /// position-projection, so the particles behave as an incompressible liquid —
 /// they pour, splash, and slosh. See `docs/solvers.md` and `docs/literature.md`
 /// §§8–9.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Strategy {
-    #[default]
     Granular,
     Pbf,
     /// Divergence-Free SPH (Bender & Koschier): crisp, low-dissipation
@@ -69,6 +74,23 @@ pub enum Strategy {
     /// MLS-MPM (Hu et al.): hybrid grid+particle method; fluid by default,
     /// elastic jelly with a swapped constitutive model. See [`mlsmpm`].
     Mlsmpm,
+    /// GPU-native live backend. Its headless `FluidSolver` adapter retains the
+    /// granular kernels for strict CPU/GPU comparison.
+    #[cfg(feature = "gpu")]
+    Gpu,
+}
+
+impl Default for Strategy {
+    fn default() -> Self {
+        #[cfg(feature = "gpu")]
+        {
+            Self::Gpu
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            Self::Granular
+        }
+    }
 }
 
 impl Strategy {
@@ -78,6 +100,8 @@ impl Strategy {
             "pbf" | "fluid" | "water" => Some(Strategy::Pbf),
             "dfsph" | "divergence-free" => Some(Strategy::Dfsph),
             "mlsmpm" | "mpm" | "jelly" => Some(Strategy::Mlsmpm),
+            #[cfg(feature = "gpu")]
+            "gpu" | "gpu-granular" => Some(Strategy::Gpu),
             _ => None,
         }
     }
@@ -89,6 +113,8 @@ impl Strategy {
             Strategy::Pbf,
             Strategy::Dfsph,
             Strategy::Mlsmpm,
+            #[cfg(feature = "gpu")]
+            Strategy::Gpu,
         ]
     }
 
@@ -99,6 +125,8 @@ impl Strategy {
             Strategy::Pbf => "pbf",
             Strategy::Dfsph => "dfsph",
             Strategy::Mlsmpm => "mlsmpm",
+            #[cfg(feature = "gpu")]
+            Strategy::Gpu => "gpu",
         }
     }
 
@@ -108,6 +136,8 @@ impl Strategy {
             Strategy::Pbf => Box::new(Pbf::new()),
             Strategy::Dfsph => Box::new(Dfsph::new()),
             Strategy::Mlsmpm => Box::new(Mlsmpm::new()),
+            #[cfg(feature = "gpu")]
+            Strategy::Gpu => Box::new(GpuGranularSolver::new(scale)),
         }
     }
 }
@@ -146,6 +176,11 @@ pub struct PerformanceStats {
     pub mean_speed: f32,
     pub max_speed: f32,
     pub pbf_density_ratio: f32,
+    /// True when the active solver completed its parallel kernels on a GPU.
+    pub gpu_enabled: bool,
+    /// End-to-end GPU submission + synchronization time. This intentionally
+    /// includes transfers: that is the cost the live simulation actually pays.
+    pub gpu_compute_time_us: u64,
 }
 
 /// A fluid-simulation strategy: one numerical method for advancing the
@@ -236,7 +271,10 @@ impl Physics {
             c_opos,
             rx,
             solver: Box::new(GranularSolver::new(scale, c_force)),
-            strategy: Strategy::default(),
+            // `new` historically constructs the CPU granular solver; callers
+            // select another strategy explicitly. Keep these two fields in
+            // agreement (the live app selects its GPU default immediately).
+            strategy: Strategy::Granular,
             scale,
             gravity: GRAVITY,
             substeps: 1,
@@ -333,6 +371,7 @@ impl Physics {
         ps.neighbor_rebuild_time_us = 0;
         ps.force_calc_time_us = 0;
         ps.collision_time_us = 0;
+        ps.gpu_compute_time_us = 0;
 
         // Small Steps (Macklin et al. 2019, stage 22): splitting the step
         // into substeps with proportionally fewer solver iterations is more

@@ -17,6 +17,10 @@ sudo pacman -S alsa-lib systemd
 
 ## Building
 
+The default build includes the `gpu` feature. On macOS, wgpu selects Metal;
+on Windows/Linux it selects the native DX12/Vulkan backend. A CPU-only library
+build remains available with `--no-default-features`.
+
 ### Debug Build (for development)
 ```bash
 cargo build
@@ -49,41 +53,33 @@ cargo run --release
 
 ## Controls
 
-- **Mouse drag**: Add 20 particles at once (cannon)
+- **Mouse drag**: Add 20 particles in detailed mode; steer massive-scale flow
 - **W/S**: Increase/decrease force scale
-- **B**: Toggle Barnes-Hut algorithm ON/OFF
-- **V**: Toggle Verlet neighbor lists ON/OFF
+- **V**: Toggle Verlet neighbor lists ON/OFF (CPU granular)
 - **A**: Toggle adaptive time-stepping ON/OFF
-
-## Compilation Status
-
-✅ **All compilation errors fixed**
-- Fixed ambiguous type error for `max_velocity`
-- Removed unused timing variables
-- Code compiles cleanly with zero errors
-- Only 2 harmless warnings about unused utility methods
-
-## Binary Size
-
-Release binary: ~13MB (includes all ggez graphics dependencies)
 
 ## Performance Testing
 
-To benchmark the optimizations:
+For a repeatable CPU/GPU comparison on the current machine:
 
-1. Start with all optimizations OFF (press B, V, A to disable)
-2. Add particles by dragging mouse
-3. Note FPS when you have ~5000 particles
-4. Enable Barnes-Hut (press B) and observe FPS improvement
-5. Enable Verlet lists (press V) for additional speedup
-6. Enable adaptive dt (press A) for stability in dense regions
+```bash
+cargo run --release --no-default-features --features gpu --bin gpu_bench -- 50000 480
+```
 
-The on-screen HUD shows:
+Run `cargo run --release` for the GPU default or add `-- --sim granular` for
+the legacy optimized CPU solver.
+
+The default GPU launch seeds 16 million particles. Override it up to the
+33,554,432-particle hard capacity with `WATERSIM_SEED_PARTICLES`.
+
+The GPU window title shows:
 - Current FPS
 - Particle count
-- Optimization status (ON/OFF for each)
-- Integration and collision timings in microseconds
-- Current timestep value
+- GPU frame encoding/submission time
+
+Set `WATERSIM_DEBUG=1` to mirror those live statistics to stderr, and set
+`WATERSIM_UNCAPPED=1` to disable vsync for throughput measurements. The legacy
+CPU strategies retain the detailed in-window phase HUD.
 
 ## Troubleshooting
 
@@ -96,9 +92,20 @@ Install `libudev-dev` (Ubuntu/Debian) or equivalent for your distro.
 ### Low FPS in debug mode
 This is expected. Use `cargo run --release` for realistic performance.
 
+### GPU fallback
+The direct app fails clearly if wgpu cannot acquire a compatible adapter. The
+headless `gpu_bench` output has a `GPU active` column so its CPU fallback cannot
+be mistaken for a GPU measurement. Use `--sim granular` to explicitly run the
+legacy CPU engine.
+
 ### Display/window issues
-The simulation requires X11 or Wayland display server. It won't run in headless environments.
+The simulation requires Metal on macOS or an X11/Wayland display server on Linux.
 
 ## Next Steps
 
-See [OPTIMIZATIONS.md](OPTIMIZATIONS.md) for detailed documentation on all implemented techniques and expected performance characteristics.
+See [docs/benchmarks/27-gpu-metal.md](docs/benchmarks/27-gpu-metal.md) for the
+compute design and M5 results, and
+[docs/benchmarks/28-zero-copy-render.md](docs/benchmarks/28-zero-copy-render.md)
+for the direct rendering architecture, and
+[docs/benchmarks/29-massive-particles.md](docs/benchmarks/29-massive-particles.md)
+for the packed 32M design and literature review.

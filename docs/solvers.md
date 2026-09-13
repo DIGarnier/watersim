@@ -1,9 +1,8 @@
 # Solvers — the strategy pattern and the method zoo
 
-This sim can run more than one particle-fluid method. Each is a **strategy**:
-a numerical model selected once at startup (`--sim <name>`) and kept for the
-whole run. This note documents the architecture and evaluates the methods —
-the two we have, and the ones we are adding.
+This sim can run more than one particle-fluid method or compute backend. Each
+is a **strategy** selected once at startup (`--sim <name>`) and kept for the
+whole run. The standard build defaults to the GPU-resident granular backend.
 
 ## Architecture: one boxed strategy, chosen once
 
@@ -22,7 +21,10 @@ pub trait FluidSolver: Send {
 Størmer–Verlet previous-position array (`c_opos`, which also encodes velocity),
 gravity, the substep count, and the adaptive-timestep controller — and holds
 the active method as one `Box<dyn FluidSolver>`. Each substep it makes exactly
-one dynamic call into the boxed strategy.
+one dynamic call into the boxed strategy. The default direct GPU application
+bypasses this CPU coordinator entirely; it keeps both solver and renderer on a
+single wgpu device. The trait path remains available for headless GPU/CPU A/B
+validation and the legacy solver modes.
 
 Two design constraints shaped this (both from the original request):
 
@@ -42,6 +44,27 @@ variant, one arm in `Strategy::make_solver`. The renderer, cannon, HUD, event
 loop, and benchmark harness are untouched — they only ever see `Physics`.
 
 ## What we have
+
+### GPU flow — wgpu compute / Metal (`gpu_app.rs`, `gpu_granular.rs`)
+
+The standard-build default has two GPU-native regimes. Through 131,072
+particles it runs integration, atomic uniform-grid construction,
+compact-support force gathering, and ping-pong Jacobi contact projection.
+Above that it switches to a fused O(N), 120 Hz procedural flow field so
+million-particle workloads do not inherit the granular model's neighbor-cost
+and catch-up spiral. At massive scale, 64-bit particle states span two storage
+shards and rotating cohorts bound per-frame simulation and point-rendering
+work. The render pipeline reads those buffers directly, so the live app
+performs no CPU readback. See `docs/benchmarks/27-gpu-metal.md`,
+`docs/benchmarks/28-zero-copy-render.md`, and
+`docs/benchmarks/29-massive-particles.md`.
+
+- Backend: `wgpu` + WGSL (Metal on Apple silicon).
+- Character: intentionally free to diverge from the legacy CPU implementation.
+- Live capacity: 33,554,432 particles across two storage shards; 16 million
+  seeded by default.
+- Validation adapter: detailed granular kernels with a 262,144-particle
+  capacity, 64 occupants per cell, and overflow readback.
 
 ### Granular — PBD non-penetration + local repulsion  (`granular.rs`)
 
